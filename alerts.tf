@@ -28,7 +28,17 @@ variable "action_group_id" {
 # Local definitions for the 11 baseline Log-search alerts
 ############################################################
 locals {
-  vm_log_alerts = [
+  all_vm_scopes = distinct(flatten([
+    var.my_scopes1,
+    var.my_scopes2,
+    # add more lists here as needed, e.g. var.my_scopes3
+  ]))
+
+  # Build the KQL-ready string: 'id1','id2','id3'
+  vm_filter_list = join(", ", [
+    for id in local.all_vm_scopes : "'${id}'"
+  ])  
+vm_log_alerts = [
     {
       alertRuleDescription = "High CPU usage on virtual machine"
       alertRuleDisplayName = "VM High CPU Usage"
