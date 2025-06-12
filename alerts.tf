@@ -60,6 +60,21 @@ locals {
       KQL
     },
     {
+      alertRuleName         = "AvailableMemoryPercentage"
+      alertRuleDisplayName  = "VM Memory Usage > 90%"
+      alertRuleDescription  = "Available Memory Percentage < 10% (usage > 90%)"
+      alertRuleSeverity     = 2
+      evaluationFrequency   = "PT5M"
+      windowSize            = "PT15M"
+      autoMitigate          = true
+      query = <<-KQL
+        InsightsMetrics
+        | where Namespace == "Memory" and Name == "Available Memory Percentage"
+        | summarize AvgAvailable = avg(Val) by bin(TimeGenerated,5m), Computer, _ResourceId
+        | where AvgAvailable < 10
+      KQL
+    },
+    {
       alertRuleDescription = "High data disk read latency on virtual machine"
       alertRuleDisplayName = "VM High Data Disk Read Latency"
       alertRuleName        = "VMHighDataDiskReadLatencyAlert"
