@@ -74,44 +74,6 @@ resource "azurerm_monitor_data_collection_rule" "dcr" {
         "\\Network Interface(*)\\Bytes Sent/sec",
       ]
     }
-
-    # ─── Platform Metrics ────────────────────────────────────────────
-    azure_metrics {
-      name              = "vmPlatformMetrics"
-      resource_id       = var.vm_resource_id
-      metric_namespace  = "Microsoft.Compute/virtualMachines"
-      metric_names = [
-        "Available Memory Bytes",
-        "Percentage CPU",
-        "CPU Credits Consumed",
-        "CPU Credits Remaining",
-        "Data Disk Bandwidth Consumed Percentage",
-        "OS Disk Bandwidth Consumed Percentage",
-        "Data Disk IOPS Consumed Percentage",
-        "OS Disk IOPS Consumed Percentage",
-        "Data Disk Max Burst IOPS",
-        "OS Disk Max Burst IOPS",
-        "Data Disk Queue Depth",
-        "OS Disk Queue Depth",
-        "Data Disk Read Operations/Sec",
-        "Disk Read Operations/Sec",
-        "Data Disk Write Operations/Sec",
-        "Disk Write Operations/Sec",
-        "Disk Read Bytes",
-        "Disk Write Bytes",
-        "Data Disk Write Bytes/sec",
-        "OS Disk Write Bytes/sec",
-        "Inbound Flows",
-        "Outbound Flows",
-        "Network In Total",
-        "Network Out Total",
-        "VM Cached Bandwidth Consumed Percentage",
-        "VM Uncached Bandwidth Consumed Percentage",
-        "VM Cached IOPS Consumed Percentage",
-        "VM Uncached IOPS Consumed Percentage",
-        "VmAvailabilityMetric",
-      ]
-    }
   }
 
   destinations {
