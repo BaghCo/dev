@@ -519,6 +519,48 @@ vm_log_alerts = [
         | where MinVal < 1
       KQL
     },
+    {
+      alertRuleName         = "VmAvailabilityDown"
+      alertRuleDisplayName  = "VM Availability Down"
+      alertRuleDescription  = "VmAvailabilityMetric <1 - VM down"
+      alertRuleSeverity     = 3
+      evaluationFrequency   = "PT5M"
+      windowSize            = "PT5M"
+      autoMitigate          = true
+      query = <<-KQL
+let svc = "YourServiceName";  // ← replace with your service’s exact display name
+
+// A: all stop events in last 24 h
+let stops = 
+  Event
+  | where TimeGenerated > ago(24h)
+    and EventLog == "System" and Source == "Service Control Manager"
+    and EventID == 7036
+    and RenderedDescription contains svc
+    and RenderedDescription endswith "entered the stopped state"
+  | project stopTime = TimeGenerated;
+
+// B: all start events in last 24 h
+let starts = 
+  Event
+  | where TimeGenerated > ago(24h)
+    and EventLog == "System" and Source == "Service Control Manager"
+    and EventID == 7036
+    and RenderedDescription contains svc
+    and RenderedDescription endswith "entered the running state"
+  | project startTime = TimeGenerated;
+
+// C: pick any stops older than 15 m with no start in the 15 m after them
+stops
+| where stopTime < now() - 15m
+| join kind=leftanti (
+    starts
+    | where startTime <= now()    // only consider starts up to “now”
+) on $left.stopTime < $right.startTime 
+   and $right.startTime <= stopTime + 15m
+      KQL
+    },
+
   ]
 }
 
