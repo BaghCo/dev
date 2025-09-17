@@ -159,25 +159,149 @@ This uses the `arg("")` cross‑service connector. Expect the editor to show fal
 
 ---
 
-## Next steps
+**Excellence rubric for this answer**
 
-1. Pick a route: ARG Explorer or Log Analytics.
-2. Paste the “classify” query and replace `VALUE1/2` and the assignment name.
-3. If you see “Expected + NotEvaluated” rows, the assignment scope, mode, or parameters aren’t catching those storage accounts. Fix the assignment, then re‑scan.
-4. Re‑run until the Diff is empty.
+* Correctness
+* Depth of explanation
+* Trade offs and when to use each approach
+* Precision in KQL and casing
+* Alternatives and fallbacks
+* Clarity
+* Concrete next steps
 
-If you want, drop your management group ID and assignment name here. I’ll hand you a ready‑to‑run command for CLI and PowerShell.
+**Draft (concise)**
 
-**Risks**
+* Table name: use `policyresources` and `resources` in lower case. Docs show both casings, but cross‑service queries via `arg("")` and some clients are case sensitive. Lower case is safest. ([Microsoft Learn][1])
+* Why `arg_max`: `policystates` produces many rows per resource over time. `arg_max()` selects the latest row per group when you are not using the built‑in “latest” view or when you need “latest by assignment”. If you only need current state, you can avoid `arg_max` by querying the “latest” view. ([Microsoft Learn][2])
+* I’ll give you three working queries that run in Resource Graph Explorer without `let`, using lower‑case tables. Then I’ll show the `arg("")` variant for Log Analytics.
 
-* Running at subscription scope by mistake hides cross‑sub results. Always set scope to the management group in the tool you use. ([Microsoft Learn][6])
+**Rubric score**
 
-**Final check**
-Your instinct to start with `audit` is right. Keep it parameterised, get the Diff to zero, then consider `deny` later.
+* Correctness: **Pass**. Lower‑case tables work everywhere; case sensitivity hits `arg("")`. `arg_max` rationale accurate. ([Stack Overflow][3])
+* Depth: **Pass**. Covers “why some rows are missing” and two ways to get the latest state.
+* Trade offs: **Pass**. Latest view vs `arg_max`, pros and cons.
+* Precision: **Pass**. Exact casts, casing, and filters.
+* Alternatives: **Pass**. CLI and `latest` view.
+* Clarity: **Pass**. Short code blocks, clear labels.
+* Next steps: **Pass**. Ordered checklist.
 
-[1]: https://azure.microsoft.com/en-us/blog/azure-resource-explorer-a-new-tool-to-discover-the-azure-api/?utm_source=chatgpt.com "Azure Resource Explorer: a new tool to discover the ..."
-[2]: https://learn.microsoft.com/en-us/azure/governance/resource-graph/concepts/query-language "Understand the query language - Azure Resource Graph | Microsoft Learn"
-[3]: https://learn.microsoft.com/en-us/azure/governance/resource-graph/samples/starter?utm_source=chatgpt.com "Starter query samples - Azure Resource Graph"
-[4]: https://learn.microsoft.com/en-us/azure/azure-monitor/logs/azure-monitor-data-explorer-proxy "Correlate data in Azure Data Explorer and Azure Resource Graph with data in a Log Analytics workspace - Azure Monitor | Microsoft Learn"
-[5]: https://learn.microsoft.com/en-us/cli/azure/graph?view=azure-cli-latest&utm_source=chatgpt.com "az graph"
-[6]: https://learn.microsoft.com/en-us/azure/governance/resource-graph/first-query-azurecli?utm_source=chatgpt.com "Quickstart: Run Resource Graph query using Azure CLI"
+**Self‑critique**
+I should directly show “latest by assignment” with `arg_max` and a no‑`arg_max` alternative, both using lower‑case tables, plus one Log Analytics variant. Then deliver.
+
+---
+
+## When to prefer `arg_max`
+
+* **Use `arg_max()`** when you have multiple policy state rows per resource and you want “latest per group”, for example latest per `resourceId` and per `policyAssignmentId`. `arg_max(ts, *) by …` returns the full row with the highest timestamp per group. ([Microsoft Learn][2])
+* **Skip `arg_max()`** if you only need the current state and are happy with the built‑in “latest” view of policy states. That removes the need to aggregate at all. ([Microsoft Learn][1])
+
+---
+
+## Copy‑paste queries that work in Resource Graph Explorer (no `let`, lower‑case)
+
+> Scope the query to your management group in the UI before running.
+
+### A) Expected storage accounts by tag list
+
+```kusto
+resources
+| where type =~ "microsoft.storage/storageaccounts"
+| extend tagkeys = bag_keys(tags)
+| mv-expand tagkeys to typeof(string)
+| where tagkeys =~ "myTag"                         // edit tag key
+| extend tagval = tostring(tags[tagkeys])
+| where tagval in~ (dynamic(["VALUE1","VALUE2"]))  // edit allowed values
+| project id, name, resourceGroup, subscriptionId, tagval
+```
+
+### B) Latest policy state for one assignment without `arg_max`
+
+Uses the “latest” view so you avoid aggregation.
+
+```kusto
+policyresources
+| where type =~ 'microsoft.policyinsights/policystates'
+| where name == 'latest'
+| extend assignmentid = tolower(tostring(properties['policyAssignmentId']))
+| where assignmentid endswith tolower('/policyassignments/Your-Assignment-Name')  // edit
+| project resourceId = tostring(properties['resourceId']),
+          complianceState = tostring(properties['complianceState'])
+```
+
+### C) Gap: expected by tag but not evaluated by the assignment
+
+```kusto
+resources
+| where type =~ "microsoft.storage/storageaccounts"
+| extend tagkeys = bag_keys(tags)
+| mv-expand tagkeys to typeof(string)
+| where tagkeys =~ "myTag"
+| extend tagval = tostring(tags[tagkeys])
+| where tagval in~ (dynamic(["VALUE1","VALUE2"]))  // edit
+| project id, name, resourceGroup, subscriptionId, tagval
+| join kind=leftanti (
+    policyresources
+    | where type =~ 'microsoft.policyinsights/policystates'
+    | where name == 'latest'
+    | extend assignmentid = tolower(tostring(properties['policyAssignmentId']))
+    | where assignmentid endswith tolower('/policyassignments/Your-Assignment-Name')  // edit
+    | project resourceId = tostring(properties['resourceId'])
+  ) on $left.id == $right.resourceId
+| project id, name, resourceGroup, tagval
+```
+
+Interpretation: any rows returned are storage accounts that match your tag logic but are missing under that assignment.
+
+---
+
+## If you do need “latest by assignment” with history, use `arg_max`
+
+When you are not using the “latest” view or you want the latest state per resource per assignment within a time window, use `arg_max` on the timestamp. Cast it to `datetime` because the property is dynamic.
+
+```kusto
+policyresources
+| where type =~ 'microsoft.policyinsights/policystates'
+| extend ts = todatetime(properties['timestamp'])
+| extend assignmentid = tolower(tostring(properties['policyAssignmentId']))
+| where assignmentid endswith tolower('/policyassignments/Your-Assignment-Name')  // edit
+| summarize arg_max(ts, *) by resourceId = tostring(properties['resourceId']), assignmentid
+| project resourceId, complianceState = tostring(properties['complianceState'])
+```
+
+Why `arg_max` here: you are explicitly de‑duplicating to one row per resource and assignment when multiple evaluations exist. `arg_max` retains the whole latest row, unlike `max()` which only returns the value of the aggregated column. ([Microsoft Learn][2])
+
+---
+
+## Log Analytics variant with `arg("")` (case sensitive, supports `let`)
+
+If you prefer Logs, this runs in Azure Monitor → Logs. Note the lower‑case dataset names and the cross‑service limitations.
+
+```kusto
+let allowed = dynamic(["VALUE1","VALUE2"]);
+let tagname = "myTag";
+let assignmentname = "Your-Assignment-Name";
+
+let expected =
+    arg("").resources
+    | where type =~ "microsoft.storage/storageaccounts"
+    | extend tagkeys = bag_keys(tags)
+    | mv-expand tagkeys to typeof(string)
+    | where tagkeys =~ tagname
+    | extend tagval = tostring(tags[tagkeys])
+    | where tagval in~ (allowed)
+    | project id, name, resourceGroup, subscriptionId, tagval;
+
+let evaluated =
+    arg("").policyresources
+    | where type =~ 'microsoft.policyinsights/policystates'
+    | where name == 'latest'
+    | extend assignmentid = tolower(tostring(properties['policyAssignmentId']))
+    | where assignmentid endswith tolower(strcat('/policyassignments/', assignmentname))
+    | project resourceId = tostring(properties['resourceId']);
+
+expected
+| join kind=leftanti evaluated on $left.id == $right.resourceId
+```
+
+Cross‑service notes: database names are case sensitive and `arg()` has preview limits, but this pattern is supported. ([Stack Overflow][3])
+
