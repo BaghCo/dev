@@ -51,7 +51,7 @@ ARG tag and type examples follow this pattern. ([Microsoft Learn][3])
 **2) Latest policy evaluation for your assignment**
 
 ```kusto
-resources
+policyresources
 | where type =~ 'Microsoft.PolicyInsights/policystates'
 | where name == 'latest'
 | extend assignmentId = tolower(tostring(properties['policyAssignmentId']))
@@ -74,7 +74,7 @@ Resources
 | where tagVal in~ (dynamic(["VALUE1","VALUE2"]))   // edit
 | project id, name, resourceGroup, subscriptionId, tagVal
 | join kind=leftanti (
-    PolicyResources
+    policyresources
     | where type =~ 'Microsoft.PolicyInsights/PolicyStates'
     | where properties.policyAssignmentName == "Your-Assignment-Name"   // edit
     | summarize arg_max(properties.timestamp, *) by resourceId = tostring(properties.resourceId)
@@ -86,7 +86,7 @@ Resources
 **4) One query that classifies each storage account**
 
 ```kusto
-Resources
+resources
 | where type =~ "Microsoft.Storage/storageAccounts"
 | extend tagKeys = bag_keys(tags)
 | mv-expand tagKeys to typeof(string)
@@ -96,7 +96,7 @@ Resources
 | extend expectedToMatch = iif(isempty(tagVal), "NoTag",
                           iif(tagVal in~ (dynamic(["VALUE1","VALUE2"])), "Expected", "NotExpected"))
 | join kind=leftouter (
-    PolicyResources
+    policyresources
     | where type =~ 'Microsoft.PolicyInsights/PolicyStates'
     | where properties.policyAssignmentName == "Your-Assignment-Name"
     | summarize arg_max(properties.timestamp, *) by resourceId = tostring(properties.resourceId)
