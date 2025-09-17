@@ -62,25 +62,6 @@ policyresources
 
 `PolicyResources` is the correct table for policy states in ARG. ([Microsoft Learn][2])
 
-**3) The gap: should match by tag, but not seen by the assignment**
-
-```kusto
-Resources
-| where type =~ "Microsoft.Storage/storageAccounts"
-| extend tagKeys = bag_keys(tags)
-| mv-expand tagKeys to typeof(string)
-| where tagKeys =~ "myTag"
-| extend tagVal = tostring(tags[tagKeys])
-| where tagVal in~ (dynamic(["VALUE1","VALUE2"]))   // edit
-| project id, name, resourceGroup, subscriptionId, tagVal
-| join kind=leftanti (
-    policyresources
-    | where type =~ 'Microsoft.PolicyInsights/PolicyStates'
-    | where properties.policyAssignmentName == "Your-Assignment-Name"   // edit
-    | summarize arg_max(properties.timestamp, *) by resourceId = tostring(properties.resourceId)
-    | project resourceId
-  ) on $left.id == $right.resourceId
-| project id, name, resourceGroup, tagVal
 ```
 
 **4) One query that classifies each storage account**
@@ -304,4 +285,111 @@ expected
 ```
 
 Cross‑service notes: database names are case sensitive and `arg()` has preview limits, but this pattern is supported. ([Stack Overflow][3])
+### How to include the Management Group in both queries
+
+> Run these in **Resource Graph Explorer** at your **management group** scope. Keep table names lower‑case: `resources`, `policyresources`, `resourcecontainers`. ([Microsoft Learn][2])
+
+---
+
+## 1) Expected storage accounts by tag, with Management Group
+
+Replace the placeholders: `myTag`, allowed values, and tweak ordering if desired.
+
+```kusto
+resources
+| where type =~ "microsoft.storage/storageaccounts"
+| extend tagkeys = bag_keys(tags)
+| mv-expand tagkeys to typeof(string)
+| where tagkeys =~ "myTag"                                    // << edit: tag key
+| extend tagval = tostring(tags[tagkeys])
+| where tagval in~ (dynamic(["VALUE1","VALUE2"]))             // << edit: allowed values
+| project id, name, resourceGroup, subscriptionId, tagval
+// Join to get the immediate parent Management Group of the subscription
+| join kind=leftouter (
+    resourcecontainers
+    | where type =~ 'microsoft.resources/subscriptions'
+    | project subscriptionId,
+              mgParentId   = tostring(properties.managementGroupAncestorsChain[0].name),
+              mgParentName = tostring(properties.managementGroupAncestorsChain[0].displayName)
+) on subscriptionId
+| project name, resourceGroup, subscriptionId, mgParentName, mgParentId, tagval
+| order by mgParentName asc, resourceGroup asc, name asc
+```
+
+Why this works
+
+* `resourcecontainers` exposes `managementGroupAncestorsChain`; index `[0]` is the **immediate parent MG**. No need to expand. ([Code is a highway][1])
+
+---
+
+## 2) GAP: should be included by tag, **but not evaluated** by your policy assignment, with Management Group
+
+Replace `Your-Assignment-Name`, `myTag`, and allowed values.
+
+```kusto
+// Left side: storage accounts that SHOULD match by tag
+resources
+| where type =~ "microsoft.storage/storageaccounts"
+| extend tagkeys = bag_keys(tags)
+| mv-expand tagkeys to typeof(string)
+| where tagkeys =~ "myTag"                                    // << edit
+| extend tagval = tostring(tags[tagkeys])
+| where tagval in~ (dynamic(["VALUE1","VALUE2"]))             // << edit
+| project idLower = tolower(id), id, name, resourceGroup, subscriptionId, tagval
+// Attach immediate parent MG for context
+| join kind=leftouter (
+    resourcecontainers
+    | where type =~ 'microsoft.resources/subscriptions'
+    | project subscriptionId,
+              mgParentId   = tostring(properties.managementGroupAncestorsChain[0].name),
+              mgParentName = tostring(properties.managementGroupAncestorsChain[0].displayName)
+) on subscriptionId
+// Right side: latest Policy state rows for that assignment
+| join kind=leftouter (
+    policyresources
+    | where type =~ 'microsoft.policyinsights/policystates'
+    | where name == 'latest'                                   // latest state view
+    | extend resourceIdLower = tolower(tostring(properties['resourceId'])),
+             assignmentId    = tolower(tostring(properties['policyAssignmentId']))
+    | where assignmentId endswith tolower('/policyassignments/Your-Assignment-Name')   // << edit
+    | project resourceIdLower
+) on $left.idLower == $right.resourceIdLower
+| where isnull(resourceIdLower)                                // emulate left-anti
+| project id, name, resourceGroup, subscriptionId, mgParentName, mgParentId, tagval
+| order by mgParentName asc, resourceGroup asc, name asc
+```
+
+Notes
+
+* ARG doesn’t support `leftanti`, so we use `leftouter` and `isnull()` to get the gap.
+* Filtering by the **assignment id suffix** is safer than name matching across scopes. ([Microsoft Learn][2])
+* Using the **latest** policy state avoids aggregation. If you later need history or “latest within a time window”, switch to `summarize arg_max(todatetime(properties['timestamp']), *) by resourceId` and keep the join. ([Stack Overflow][3])
+
+---
+
+### Want the full MG chain instead of just the immediate parent?
+
+Swap the MG join in either query for this expanded version. It returns **one row per MG ancestor** per resource.
+
+```kusto
+| join kind=leftouter (
+    resourcecontainers
+    | where type =~ 'microsoft.resources/subscriptions'
+    | mv-expand mg = properties.managementGroupAncestorsChain
+    | project subscriptionId,
+              mgId   = tostring(mg.name),
+              mgName = tostring(mg.displayName)
+) on subscriptionId
+```
+
+The chain is provided in reverse order: immediate parent first, up to the root. ([Code is a highway][1])
+
+---
+
+## Why this is robust
+
+* The MG mapping is done at the **subscription** layer, which is authoritative for MG hierarchy. ([Code is a highway][1])
+* The GAP logic is deterministic and avoids ARG operators that aren’t supported, while mirroring the set difference you want. ([Microsoft Learn][2])
+
+---
 
