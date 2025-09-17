@@ -1,33 +1,3 @@
-**Excellence rubric**
-
-* Correctness
-* Depth
-* Trade offs
-* Exactness
-* Alternatives
-* Clarity
-* Next steps
-
-**Draft (brief)**
-
-* You’re in the wrong place. Azure Resource Explorer doesn’t run KQL. Use Azure Resource Graph Explorer, `az graph query`, PowerShell `Search-AzGraph`, or Log Analytics with `arg("")` if you want full KQL conveniences. ([Microsoft Azure][1])
-* ARG Explorer can run the queries I gave, but if it chokes on `let`, use the no‑`let` versions below. Or run them from Log Analytics with `arg("")`, which supports `let` and cross‑service joins. ([Microsoft Learn][2])
-
-**Rubric score**
-
-* Correctness: Pass. Points to the right tools and tables. ([Microsoft Azure][1])
-* Depth: Pass. Shows four execution paths and pitfalls. ([Microsoft Learn][3])
-* Trade offs: Pass. Notes `let` support and preview limits in Log Analytics. ([Microsoft Learn][4])
-* Exactness: Pass. Gives portal path, CLI/PS commands, and copy‑paste KQL. ([Microsoft Learn][5])
-* Alternatives: Pass. Offers no‑`let` queries and Log Analytics route.
-* Clarity: Pass. Short steps and labelled snippets.
-* Next steps: Pass. Ordered checklist.
-
-**Self‑critique**
-I’m assuming `PolicyResources` is available to you, which is generally true. I should show exact portal clicks, two runnable versions of each query (with and without `let`), and warn about Log Analytics preview quirks and the 1,000‑row `arg()` cap. Then finalise.
-
----
-
 ## Where to run these queries (and why Resource Explorer fails)
 
 * **Azure Resource Explorer** (resources.azure.com and the Portal “Resource Explorer”) is a REST object browser for ARM. It does not execute KQL. That’s why `let` errors out. ([Microsoft Azure][1])
@@ -66,7 +36,7 @@ Run KQL in one of these instead:
 Replace the values in the dynamic array.
 
 ```kusto
-Resources
+resources
 | where type =~ "Microsoft.Storage/storageAccounts"
 | extend tagKeys = bag_keys(tags)
 | mv-expand tagKeys to typeof(string)
@@ -81,11 +51,13 @@ ARG tag and type examples follow this pattern. ([Microsoft Learn][3])
 **2) Latest policy evaluation for your assignment**
 
 ```kusto
-PolicyResources
-| where type =~ 'Microsoft.PolicyInsights/PolicyStates'
-| where properties.policyAssignmentName == "Your-Assignment-Name"   // edit
-| summarize arg_max(properties.timestamp, *) by resourceId = tostring(properties.resourceId)
-| project resourceId, complianceState = tostring(properties.complianceState)
+resources
+| where type =~ 'Microsoft.PolicyInsights/policystates'
+| where name == 'latest'
+| extend assignmentId = tolower(tostring(properties['policyAssignmentId']))
+| where assignmentId endswith tolower('/policyAssignments/Your-Assignment-Name')   // edit
+| project resourceId = tostring(properties['resourceId']),
+          complianceState = tostring(properties['complianceState'])
 ```
 
 `PolicyResources` is the correct table for policy states in ARG. ([Microsoft Learn][2])
