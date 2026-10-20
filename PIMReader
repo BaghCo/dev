@@ -8,6 +8,8 @@
     assignments and the corresponding role management policies at each scope,
     and saves a collapsible HTML tree, text tree, summary CSV, rule CSV and JSON.
     Diagnostics are written during scanning as well as in the final report.
+    ARM timeouts are retried, temporary file-sharing violations cannot stop
+    collection, and MG/subscription policies are read before resource groups.
     A 404 on a resource-group PIM API is checked against the resource-group GET
     endpoint before calling that group missing; failed scopes are not counted
     as empty configuration.
@@ -24,13 +26,13 @@
     Does not enumerate PIM eligible or active *principal* assignments.
 .EXAMPLE
     Connect-AzAccount -Tenant '<tenant-guid>'
-    ./Get-AzurePimPolicyTree-v3.ps1
+    ./Get-AzurePimPolicyTree-v4.ps1
 .EXAMPLE
-    ./Get-AzurePimPolicyTree-v3.ps1 -ManagementGroupId 'platform' -ScopeDepth ResourceGroups
+    ./Get-AzurePimPolicyTree-v4.ps1 -ManagementGroupId 'platform' -ScopeDepth ResourceGroups
 .EXAMPLE
-    ./Get-AzurePimPolicyTree-v3.ps1 -ScopeDepth Resources -OutputDirectory ./PimFull -FailOnErrors
+    ./Get-AzurePimPolicyTree-v4.ps1 -ScopeDepth Resources -OutputDirectory ./PimFull -FailOnErrors
 .EXAMPLE
-    ./Get-AzurePimPolicyTree-v3.ps1 -SubscriptionId (Get-AzContext).Subscription.Id
+    ./Get-AzurePimPolicyTree-v4.ps1 -SubscriptionId (Get-AzContext).Subscription.Id
     # Bypass management-group enumeration to verify an accessible subscription.
 .NOTES
     Requires Az.Accounts and an authenticated Azure context in the target tenant.
@@ -72,17 +74,20 @@ $script:Errors = [System.Collections.Generic.List[object]]::new()
 $script:Requests = [System.Collections.Generic.List[object]]::new()
 $script:RoleNames = @{}
 $script:RootNode = $null
+$script:JournalWriteFailures = 0
+$script:RecoveredPolicyWrites = 0
 
 # Write diagnostics immediately so a failed or interrupted run still leaves evidence.
 # These are separate from the final *_requests.csv, *_errors.csv and *_scopes.csv.
 [void] (New-Item -ItemType Directory -Path $OutputDirectory -Force -ErrorAction Stop)
 $out = (Resolve-Path -Path $OutputDirectory -ErrorAction Stop).Path
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$stamp = '{0}_{1}' -f (Get-Date -Format 'yyyyMMdd_HHmmss_fff'), ([guid]::NewGuid().ToString('N').Substring(0,8))
 $stem = Join-Path $out "AzurePim_$stamp"
 $script:LiveRequestsPath = "${stem}_requests.live.csv"
 $script:LiveErrorsPath = "${stem}_errors.live.csv"
 $script:LiveScopesPath = "${stem}_scopes.live.csv"
 $script:LivePoliciesPath = "${stem}_policies.partial.jsonl"
+$script:PolicyRecoveryDirectory = "${stem}_policies.recovery"
 "Path,Result,ItemCount,Error" | Set-Content -Path $script:LiveRequestsPath -Encoding utf8
 "ScopeId,Operation,Error" | Set-Content -Path $script:LiveErrorsPath -Encoding utf8
 "ScopeId,ScopeKind,Status,AssignmentCount,PolicyCount,PolicyRecords" | Set-Content -Path $script:LiveScopesPath -Encoding utf8
@@ -91,9 +96,58 @@ Write-Host "PIM collection started. Live diagnostics: $out" -ForegroundColor Cya
 
 function Write-LiveCsvRow {
     param([string] $Path, [object] $Row)
-    # The headers above are created before scanning. Export-Csv -Append never
-    # treats a failed scope as a successful zero-record result.
-    $Row | Export-Csv -Path $Path -NoTypeInformation -Encoding utf8 -Append -ErrorAction Stop
+    # Live diagnostics are best effort. A temporary share lock from Excel,
+    # antivirus or synchronisation must never stop an ARM scan or mask an error.
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            $Row | Export-Csv -Path $Path -NoTypeInformation -Encoding utf8 -Append -ErrorAction Stop
+            return
+        }
+        catch {
+            $message = $_.Exception.Message
+            $isLock = ($_.Exception -is [System.IO.IOException] -or $message -match '(?i)being used by another process|sharing violation|file.*locked')
+            if ($isLock -and $attempt -lt 6) {
+                Start-Sleep -Milliseconds (200 * $attempt)
+                continue
+            }
+            $script:JournalWriteFailures++
+            Write-Warning "Non-fatal diagnostic CSV write failure ($Path): $message. In-memory results are retained for the final export."
+            return
+        }
+    }
+}
+
+function Write-LivePolicyRecord {
+    param([Parameter(Mandatory)] $Record)
+    # A policy is already saved in memory before this function is called.
+    # If the shared JSONL file stays locked, use an independent recovery file.
+    $json = ConvertTo-Json -InputObject $Record -Depth 60 -Compress
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            [System.IO.File]::AppendAllText($script:LivePoliciesPath, ($json + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+            return
+        }
+        catch {
+            $message = $_.Exception.Message
+            $isLock = ($_.Exception -is [System.IO.IOException] -or $message -match '(?i)being used by another process|sharing violation|file.*locked')
+            if ($isLock -and $attempt -lt 6) {
+                Start-Sleep -Milliseconds (200 * $attempt)
+                continue
+            }
+            break
+        }
+    }
+    try {
+        [void] (New-Item -ItemType Directory -Path $script:PolicyRecoveryDirectory -Force -ErrorAction Stop)
+        $recoveryFile = Join-Path $script:PolicyRecoveryDirectory (([guid]::NewGuid().ToString('N')) + '.json')
+        [System.IO.File]::WriteAllText($recoveryFile, $json, [System.Text.UTF8Encoding]::new($false))
+        $script:RecoveredPolicyWrites++
+        Write-Warning "Partial JSONL unavailable; policy saved to recovery file: $recoveryFile"
+    }
+    catch {
+        $script:JournalWriteFailures++
+        Write-Warning "Unable to checkpoint a policy record to disk: $($_.Exception.Message). Policy remains in memory for the final export."
+    }
 }
 
 function Add-RequestRecord {
@@ -131,7 +185,7 @@ function Invoke-ArmJson {
         }
         catch {
             $message = $_.Exception.Message
-            if ($attempt -lt 4 -and $message -match '(429|TooManyRequests|throttl|(?:^|\D)50[0234](?:\D|$)|temporar)') {
+            if ($attempt -lt 4 -and $message -match '(?i)(429|TooManyRequests|throttl|(?:^|\D)50[0234](?:\D|$)|temporar|timed?\s*out|time\s*out|timeout|operation\s+(?:was\s+)?cancell?ed|taskcanceledexception|connection\s+(?:was\s+)?(?:reset|closed))') {
                 Start-Sleep -Seconds ([int][math]::Pow(2, $attempt))
                 continue
             }
@@ -367,10 +421,8 @@ function New-PolicyRecord {
     }
     [void] $Node.Policies.Add($record)
     [void] $script:AllPolicies.Add($record)
-    # Preserve the actual rule payload before the final HTML/CSV export.
-    # JSONL is valid even if collection stops before the last scope.
-    $jsonLine = ConvertTo-Json -InputObject $record -Depth 60 -Compress
-    Add-Content -Path $script:LivePoliciesPath -Value $jsonLine -Encoding utf8 -ErrorAction Stop
+    # Save before final HTML/CSV export. File-sharing violations are non-fatal.
+    Write-LivePolicyRecord -Record $record
 }
 
 function Read-ScopePolicies {
@@ -604,23 +656,45 @@ else {
     }
 }
 
-# 2. Discover deeper scopes only when requested. Keep the tree even if enumeration fails.
+# 2. Scan management groups and subscriptions FIRST, so data can be checkpointed
+# even if a later resource-group enumeration stalls or fails.
+function Invoke-ScanNode {
+    param([Parameter(Mandatory)] $Node)
+    try {
+        Read-ScopePolicies -Node $Node
+    }
+    catch {
+        $Node.Status = 'PARTIAL / ERROR'
+        Add-ReportError -ScopeId $Node.Id -Operation 'Unexpected scope processing exception' -Message $_.Exception.Message
+    }
+    finally {
+        Write-ScopeRecord -Node $Node
+    }
+}
+foreach ($node in @($script:AllNodes.ToArray())) {
+    Invoke-ScanNode -Node $node
+}
+
+# 3. For deeper scans, enumerate and query each resource group as it is found.
+# A failing subscription no longer holds up the entire management-group report.
 if ($ScopeDepth -ne 'ManagementGroupsAndSubscriptions') {
     $subscriptions = @($script:AllNodes | Where-Object { $_.Kind -eq 'Subscription' })
     foreach ($sub in $subscriptions) {
         try {
             foreach ($rg in @(Get-ArmList -Path ('{0}/resourceGroups?api-version=2021-04-01' -f $sub.Id))) {
-                if ($rg.id) { [void] (Add-Node -Id $rg.id -Name $rg.name -Kind 'ResourceGroup' -ParentId $sub.Id) }
+                if (-not $rg.id) { continue }
+                $rgNode = Add-Node -Id $rg.id -Name $rg.name -Kind 'ResourceGroup' -ParentId $sub.Id
+                Invoke-ScanNode -Node $rgNode
             }
         }
         catch {
-            Add-ReportError -ScopeId $sub.Id -Operation 'List resource groups' -Message $_.Exception.Message
+            Add-ReportError -ScopeId $sub.Id -Operation 'List/scan resource groups' -Message $_.Exception.Message
         }
         if ($ScopeDepth -eq 'Resources') {
             try {
                 foreach ($resource in @(Get-ArmList -Path ('{0}/resources?api-version=2021-04-01' -f $sub.Id))) {
                     if (-not $resource.id) { continue }
-                    # Exclude authorisation metadata to avoid querying the policy objects themselves.
+                    # Avoid recursively querying PIM metadata objects.
                     if ([string] $resource.type -match '(?i)^Microsoft.Authorization/(roleManagement|roleAssignment|roleEligibility)') { continue }
                     $rgPrefix = ''
                     if ([string] $resource.id -match '(?i)^(/subscriptions/[^/]+/resourceGroups/[^/]+)') {
@@ -628,27 +702,14 @@ if ($ScopeDepth -ne 'ManagementGroupsAndSubscriptions') {
                     }
                     $parent = if ($rgPrefix -and $script:Nodes.ContainsKey($rgPrefix)) { $rgPrefix } else { $sub.Id }
                     $resourceName = '{0}/{1}' -f $resource.type, $resource.name
-                    [void] (Add-Node -Id $resource.id -Name $resourceName -Kind 'Resource' -ParentId $parent)
+                    $resourceNode = Add-Node -Id $resource.id -Name $resourceName -Kind 'Resource' -ParentId $parent
+                    Invoke-ScanNode -Node $resourceNode
                 }
             }
             catch {
-                Add-ReportError -ScopeId $sub.Id -Operation 'List resources' -Message $_.Exception.Message
+                Add-ReportError -ScopeId $sub.Id -Operation 'List/scan resources' -Message $_.Exception.Message
             }
         }
-    }
-}
-
-# 3. Query both policy-to-role associations and policy rules, at EACH distinct scope.
-foreach ($node in @($script:AllNodes.ToArray())) {
-    try {
-        Read-ScopePolicies -Node $node
-    }
-    catch {
-        $node.Status = 'PARTIAL / ERROR'
-        Add-ReportError -ScopeId $node.Id -Operation 'Unexpected scope processing exception' -Message $_.Exception.Message
-    }
-    finally {
-        Write-ScopeRecord -Node $node
     }
 }
 Write-Progress -Activity 'Reading Azure PIM settings' -Completed
@@ -734,6 +795,8 @@ $inventory = [pscustomobject] @{
     ScopeDepth = $ScopeDepth
     GeneratedUtc = [datetime]::UtcNow.ToString('o')
     CollectionErrors = $script:Errors.Count
+    LiveJournalWriteFailures = $script:JournalWriteFailures
+    PolicyRecoveryFiles = $script:RecoveredPolicyWrites
     RG404Verification = 'RG existence checked only after a PIM endpoint 404; policy API 404 alone is not evidence that an RG is absent.' 
     PolicySettingsCompleteForScannedScopes = ($script:Errors.Count -eq 0 -and $script:AllPolicies.Count -gt 0)
     Warning = $(if ($script:AllPolicies.Count -eq 0) { 'Zero PIM settings obtained. Do not interpret this as evidence that PIM is unconfigured.' } else { $null })
@@ -762,7 +825,7 @@ if ($script:Errors.Count -gt 0) {
 
 $scanned = @($script:AllNodes | Where-Object { $_.Status -ne 'Not scanned' }).Count
 Write-Host "Report: $out" -ForegroundColor Cyan
-Write-Host "Scopes scanned: $scanned; policies: $($script:AllPolicies.Count); errors: $($script:Errors.Count)"
+Write-Host "Scopes scanned: $scanned; policies: $($script:AllPolicies.Count); API/scan errors: $($script:Errors.Count); live journal write failures: $($script:JournalWriteFailures)"
 Write-Host "Tree: ${stem}_tree.html"
 Write-Host "Text: ${stem}_tree.txt"
 Write-Host "Policies: ${stem}_policies.csv; rules: ${stem}_rules.csv"
@@ -770,6 +833,8 @@ Write-Host "Raw JSON: ${stem}_full.json; errors: ${stem}_errors.csv"
 Write-Host "Diagnostics: ${stem}_scopes.csv; ${stem}_requests.csv"
 Write-Host "During-scan journals: ${stem}_scopes.live.csv; ${stem}_requests.live.csv; ${stem}_errors.live.csv"
 Write-Host "Durable partial policy data: ${stem}_policies.partial.jsonl"
+if ($script:RecoveredPolicyWrites -gt 0) { Write-Warning "$($script:RecoveredPolicyWrites) policies saved in the recovery directory: $script:PolicyRecoveryDirectory" }
+if ($script:JournalWriteFailures -gt 0) { Write-Warning 'Some live journals were unavailable. Use the final CSV/JSON exports for the complete collected results.' }
 $discoveredSubs = @($script:AllNodes | Where-Object { $_.Kind -eq 'Subscription' }).Count
 Write-Host "Subscription scopes discovered: $discoveredSubs"
 if ($script:Errors.Count -gt 0) {
