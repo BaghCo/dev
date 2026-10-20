@@ -1,0 +1,20 @@
+$folder = ".\AzurePimReport"
+
+$file = Get-ChildItem $folder -Filter "*_policies.partial.jsonl" |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+$policies = @(
+    Get-Content $file.FullName |
+        Where-Object { $_.Trim() } |
+        ForEach-Object { $_ | ConvertFrom-Json }
+)
+
+Write-Host "Policies retrieved: $($policies.Count)"
+
+$policies |
+    Select-Object ScopeKind, ScopeName, RoleDefinitionGuid,
+        @{N='MaxActivation';E={$_.Summary.ActivationMaxDuration}},
+        @{N='MFA';E={$_.Summary.ActivationMFA}},
+        @{N='Approval';E={$_.Summary.ActivationApproval}} |
+    Format-Table -AutoSize
