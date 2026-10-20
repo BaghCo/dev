@@ -1,3 +1,4 @@
+1. Check whether any PIM policies were retrieved
 $folder = ".\AzurePimReport"
 
 $file = Get-ChildItem $folder -Filter "*_policies.partial.jsonl" |
@@ -18,3 +19,12 @@ $policies |
         @{N='MFA';E={$_.Summary.ActivationMFA}},
         @{N='Approval';E={$_.Summary.ActivationApproval}} |
     Format-Table -AutoSize
+
+2. Inspect the failures
+$file = Get-ChildItem $folder -Filter "*_errors.live.csv" |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+Import-Csv $file.FullName |
+    Select-Object -Last 10 |
+    Format-List
