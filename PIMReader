@@ -1,3 +1,451 @@
+#requires -Version 7.0
+<#
+.SYNOPSIS
+    Export Azure-resource PIM role settings as a management-group hierarchy.
+.DESCRIPTION
+    Read-only. Uses Azure Resource Manager, not Microsoft Graph or AzGovViz.
+    Discovers the management-group / subscription tree, lists role management policy
+    assignments and the corresponding role management policies at each scope,
+    and saves a collapsible HTML tree, text tree, summary CSV, rule CSV and JSON.
+
+    Coverage defaults to management groups and subscriptions. Choose ResourceGroups
+    or Resources to examine those levels too. Individual resources can cause a
+    large number of ARM requests. A scope with no results is not the same as a
+    scope for which the API returned an error: errors are reported separately.
+
+    PIM role policies DO NOT inherit down the management-group hierarchy.
+    Azure RBAC role assignments may inherit, but PIM role *settings* do not.
+
+    Excludes Microsoft Entra directory-role PIM and PIM for Groups (Graph APIs).
+    Does not enumerate PIM eligible or active *principal* assignments.
+.EXAMPLE
+    Connect-AzAccount -Tenant '<tenant-guid>'
+    ./Get-AzurePimPolicyTree.ps1
+.EXAMPLE
+    ./Get-AzurePimPolicyTree.ps1 -ManagementGroupId 'platform' -ScopeDepth ResourceGroups
+.EXAMPLE
+    ./Get-AzurePimPolicyTree.ps1 -ScopeDepth Resources -OutputDirectory ./PimFull -FailOnErrors
+.NOTES
+    Requires Az.Accounts and an authenticated Azure context in the target tenant.
+    Grant Reader access on the starting management group and its descendants,
+    including subscriptions, for a complete report. No permissions are elevated.
+#>
+[CmdletBinding()]
+param(
+    [string] $ManagementGroupId,
+    [ValidateSet('ManagementGroupsAndSubscriptions', 'ResourceGroups', 'Resources')]
+    [string] $ScopeDepth = 'ManagementGroupsAndSubscriptions',
+    [string] $OutputDirectory = (Join-Path (Get-Location).Path 'AzurePimReport'),
+    [switch] $NoRoleNameResolution,
+    [switch] $FailOnErrors
+)
+
+$ErrorActionPreference = 'Stop'
+Import-Module Az.Accounts -ErrorAction Stop
+$context = Get-AzContext
+if (-not $context -or -not $context.Tenant -or -not $context.Tenant.Id) {
+    throw 'No Azure context. Run Connect-AzAccount -Tenant <tenant-id> first.'
+}
+if ([string]::IsNullOrWhiteSpace($ManagementGroupId)) {
+    $ManagementGroupId = [string] $context.Tenant.Id
+}
+
+$script:Nodes = @{}
+$script:AllNodes = [System.Collections.Generic.List[object]]::new()
+$script:AllPolicies = [System.Collections.Generic.List[object]]::new()
+$script:Errors = [System.Collections.Generic.List[object]]::new()
+$script:RoleNames = @{}
+$script:RootNode = $null
+
+function Invoke-ArmJson {
+    param([Parameter(Mandatory)][string] $Path)
+
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        $response = $null
+        $requestParams = @{ Method = 'GET'; ErrorAction = 'Stop' }
+        if ($Path -match '^https://') { $requestParams.Uri = [uri] $Path }
+        else { $requestParams.Path = $Path }
+
+        try {
+            $response = Invoke-AzRestMethod @requestParams
+        }
+        catch {
+            $message = $_.Exception.Message
+            if ($attempt -lt 4 -and $message -match '(429|TooManyRequests|throttl|(?:^|\D)50[0234](?:\D|$)|temporar)') {
+                Start-Sleep -Seconds ([int][math]::Pow(2, $attempt))
+                continue
+            }
+            throw "ARM GET failed for ${Path}: $message"
+        }
+
+        $status = [int] $response.StatusCode
+        if (($status -eq 429 -or $status -ge 500) -and $attempt -lt 4) {
+            Start-Sleep -Seconds ([int][math]::Pow(2, $attempt))
+            continue
+        }
+        if ($status -lt 200 -or $status -ge 300) {
+            $detail = [string] $response.Content
+            try {
+                $serverError = ConvertFrom-Json -InputObject $detail -Depth 100
+                if ($serverError.error.message) { $detail = $serverError.error.message }
+            }
+            catch { }
+            throw "ARM GET $status for ${Path}: $detail"
+        }
+        if ([string]::IsNullOrWhiteSpace([string] $response.Content)) { return $null }
+        return ConvertFrom-Json -InputObject ([string] $response.Content) -Depth 100
+    }
+    throw "ARM request could not be completed: $Path"
+}
+
+function Get-ArmList {
+    param([Parameter(Mandatory)][string] $Path)
+    $next = $Path
+    $seenLinks = @{}
+    while (-not [string]::IsNullOrWhiteSpace($next)) {
+        if ($seenLinks.ContainsKey($next)) { throw "Repeated ARM continuation link: $next" }
+        $seenLinks[$next] = $true
+        $result = Invoke-ArmJson -Path $next
+        if ($null -eq $result -or $null -eq $result.PSObject.Properties['value']) { throw "Unexpected ARM list result (missing value): $next" }
+        foreach ($item in @($result.value)) { if ($null -ne $item) { Write-Output $item } }
+        $next = [string] $result.nextLink
+    }
+}
+
+function Add-ReportError {
+    param([string] $ScopeId, [string] $Operation, [string] $Message)
+    [void] $script:Errors.Add([pscustomobject] @{
+        ScopeId = $ScopeId; Operation = $Operation; Error = $Message
+    })
+    Write-Warning "[$Operation] ${ScopeId}: $Message"
+}
+
+function Add-Node {
+    param([string] $Id, [string] $Name, [string] $Kind, [string] $ParentId = '')
+    $Id = $Id.TrimEnd('/')
+    if ($script:Nodes.ContainsKey($Id)) { return $script:Nodes[$Id] }
+    $node = [pscustomobject] @{
+        Id = $Id
+        Name = $(if ($Name) { $Name } else { ($Id -split '/')[-1] })
+        Kind = $Kind
+        ParentId = $ParentId
+        Children = [System.Collections.Generic.List[object]]::new()
+        Policies = [System.Collections.Generic.List[object]]::new()
+        Status = 'Not scanned'
+    }
+    $script:Nodes[$Id] = $node
+    [void] $script:AllNodes.Add($node)
+    if ($ParentId -and $script:Nodes.ContainsKey($ParentId)) {
+        [void] $script:Nodes[$ParentId].Children.Add($node)
+    }
+    return $node
+}
+
+function Add-ManagementGroupChildren {
+    param($Children, [string] $ParentId)
+    foreach ($child in @($Children)) {
+        if ($null -eq $child -or -not $child.id) { continue }
+        if ([string] $child.type -match '(?i)managementgroups') {
+            $kind = 'ManagementGroup'
+        }
+        elseif ([string] $child.id -match '(?i)^/subscriptions/') {
+            $kind = 'Subscription'
+        }
+        else {
+            Add-ReportError -ScopeId $ParentId -Operation 'Hierarchy' -Message "Unexpected hierarchy child: $($child.id)"
+            continue
+        }
+        [void] (Add-Node -Id $child.id -Name $child.displayName -Kind $kind -ParentId $ParentId)
+        if ($kind -eq 'ManagementGroup') {
+            Add-ManagementGroupChildren -Children $child.children -ParentId $child.id
+        }
+    }
+}
+
+function Get-Rule {
+    param([object[]] $Rules, [string] $RuleId)
+    foreach ($r in $Rules) {
+        if ($null -ne $r -and [string] $r.id -ieq $RuleId) { return $r }
+    }
+    return $null
+}
+
+function Bool-Text {
+    param($Value)
+    if ($null -eq $Value) { return '?' }
+    if ([bool] $Value) { return 'Yes' }
+    return 'No'
+}
+
+function Get-PolicySummary {
+    param([object[]] $Rules)
+    $enable = Get-Rule -Rules $Rules -RuleId 'Enablement_EndUser_Assignment'
+    $expiry = Get-Rule -Rules $Rules -RuleId 'Expiration_EndUser_Assignment'
+    $approval = Get-Rule -Rules $Rules -RuleId 'Approval_EndUser_Assignment'
+    $contextRule = Get-Rule -Rules $Rules -RuleId 'AuthenticationContext_EndUser_Assignment'
+    $eligible = Get-Rule -Rules $Rules -RuleId 'Expiration_Admin_Eligibility'
+    $active = Get-Rule -Rules $Rules -RuleId 'Expiration_Admin_Assignment'
+
+    $flags = @()
+    if ($null -ne $enable) { $flags = @($enable.enabledRules) }
+    $mfa = if ($null -eq $enable) { $null } else { [bool] ($flags -contains 'MultiFactorAuthentication') }
+    $just = if ($null -eq $enable) { $null } else { [bool] ($flags -contains 'Justification') }
+    $ticket = if ($null -eq $enable) { $null } else { [bool] ($flags -contains 'Ticketing') }
+    $approvalRequired = if ($null -eq $approval) { $null } else { $approval.setting.isApprovalRequired }
+    $conditionalAccess = if ($null -eq $contextRule) { $null } else { $contextRule.isEnabled }
+
+    $approvers = [System.Collections.Generic.List[string]]::new()
+    if ($null -ne $approval) {
+        foreach ($stage in @($approval.setting.approvalStages)) {
+            if ($null -eq $stage) { continue }
+            foreach ($person in @($stage.primaryApprovers)) {
+                if ($null -eq $person) { continue }
+                if ($person.description) { [void] $approvers.Add([string] $person.description) }
+                elseif ($person.id) { [void] $approvers.Add([string] $person.id) }
+            }
+        }
+    }
+    $notificationCount = @($Rules | Where-Object { $_.ruleType -eq 'RoleManagementPolicyNotificationRule' }).Count
+    $eligiblePermanent = if ($null -eq $eligible) { $null } else { -not [bool] $eligible.isExpirationRequired }
+    $activePermanent = if ($null -eq $active) { $null } else { -not [bool] $active.isExpirationRequired }
+
+    return [pscustomobject] @{
+        ActivationMaxDuration = $(if ($expiry) { $expiry.maximumDuration } else { $null })
+        ActivationMFA = $mfa
+        ActivationJustification = $just
+        ActivationTicket = $ticket
+        ActivationApproval = $approvalRequired
+        ApprovalApprovers = ($approvers -join '; ')
+        ConditionalAccessContextEnabled = $conditionalAccess
+        ConditionalAccessContextId = $(if ($contextRule) { $contextRule.claimValue } else { $null })
+        EligiblePermanentAllowed = $eligiblePermanent
+        EligibleMaxDuration = $(if ($eligible) { $eligible.maximumDuration } else { $null })
+        ActivePermanentAllowed = $activePermanent
+        ActiveMaxDuration = $(if ($active) { $active.maximumDuration } else { $null })
+        NotificationRuleCount = $notificationCount
+    }
+}
+
+function New-PolicyRecord {
+    param($Node, $Assignment, $Policy, [string] $PolicyId, [string] $RoleDefinitionId)
+    $rules = @()
+    if ($null -ne $Policy -and $null -ne $Policy.properties.effectiveRules -and @($Policy.properties.effectiveRules).Count -gt 0) {
+        $rules = @($Policy.properties.effectiveRules)
+    }
+    elseif ($null -ne $Policy -and $null -ne $Policy.properties.rules -and @($Policy.properties.rules).Count -gt 0) {
+        $rules = @($Policy.properties.rules)
+    }
+    elseif ($null -ne $Assignment) {
+        $rules = @($Assignment.properties.effectiveRules | Where-Object { $null -ne $_ })
+    }
+
+    $summary = Get-PolicySummary -Rules $rules
+    $roleGuid = if ($RoleDefinitionId) { ($RoleDefinitionId.TrimEnd('/') -split '/')[-1] } else { '' }
+    $record = [pscustomobject] @{
+        ScopeId = $Node.Id
+        ScopeName = $Node.Name
+        ScopeKind = $Node.Kind
+        RoleName = $(if ($roleGuid) { $roleGuid } else { '[Unmapped policy]' })
+        RoleDefinitionId = $RoleDefinitionId
+        RoleDefinitionGuid = $roleGuid
+        PolicyId = $PolicyId
+        IsOrganisationDefault = $(if ($Policy) { $Policy.properties.isOrganizationDefault } else { $null })
+        LastModified = $(if ($Policy) { $Policy.properties.lastModifiedDateTime } else { $null })
+        Summary = $summary
+        Rules = $rules
+        PolicyRaw = $Policy
+        AssignmentRaw = $Assignment
+    }
+    [void] $Node.Policies.Add($record)
+    [void] $script:AllPolicies.Add($record)
+}
+
+function Read-ScopePolicies {
+    param($Node)
+    Write-Progress -Activity 'Reading Azure PIM settings' -Status "[$($script:AllPolicies.Count) policies] $($Node.Kind): $($Node.Name)" -PercentComplete -1
+    $scope = $Node.Id
+    $assignments = @()
+    $policies = @()
+    $assignmentsOK = $true
+    $policiesOK = $true
+    try {
+        $assignments = @(Get-ArmList -Path ('{0}/providers/Microsoft.Authorization/roleManagementPolicyAssignments?api-version=2020-10-01' -f $scope))
+    }
+    catch {
+        $assignmentsOK = $false
+        Add-ReportError -ScopeId $scope -Operation 'List policy assignments' -Message $_.Exception.Message
+    }
+    try {
+        $policies = @(Get-ArmList -Path ('{0}/providers/Microsoft.Authorization/roleManagementPolicies?api-version=2020-10-01' -f $scope))
+    }
+    catch {
+        $policiesOK = $false
+        Add-ReportError -ScopeId $scope -Operation 'List policies' -Message $_.Exception.Message
+    }
+
+    # Some list operations can include policy objects belonging to a different scope.
+    # Never misrepresent a parent policy as being configured on a descendant.
+    $policies = @($policies | Where-Object {
+        -not $_.properties.scope -or ([string] $_.properties.scope).TrimEnd('/') -ieq $scope.TrimEnd('/')
+    })
+    $byId = @{}
+    foreach ($p in $policies) {
+        if ($p.id) { $byId[[string] $p.id.TrimEnd('/')] = $p }
+    }
+    $matched = @{}
+    foreach ($a in $assignments) {
+        if ($null -eq $a -or $null -eq $a.properties) { continue }
+        $assignmentScope = [string] $a.properties.scope
+        if ($assignmentScope -and $assignmentScope.TrimEnd('/') -ine $scope.TrimEnd('/')) {
+            # Never label a policy on another scope as a locally configured policy.
+            continue
+        }
+        $policyId = [string] $a.properties.policyId
+        $roleId = [string] $a.properties.roleDefinitionId
+        $policy = $null
+        if ($policyId -and $byId.ContainsKey($policyId.TrimEnd('/'))) {
+            $policy = $byId[$policyId.TrimEnd('/')]
+        }
+        elseif ($policyId) {
+            try {
+                $policy = Invoke-ArmJson -Path ('{0}?api-version=2020-10-01' -f $policyId.TrimEnd('/'))
+            }
+            catch {
+                Add-ReportError -ScopeId $scope -Operation 'Get linked policy' -Message $_.Exception.Message
+            }
+        }
+        New-PolicyRecord -Node $Node -Assignment $a -Policy $policy -PolicyId $policyId -RoleDefinitionId $roleId
+        if ($policyId) { $matched[$policyId.TrimEnd('/')] = $true }
+    }
+    foreach ($p in $policies) {
+        if ($p.id -and -not $matched.ContainsKey(([string] $p.id).TrimEnd('/'))) {
+            # Include policies that cannot be mapped to a role, rather than silently dropping them.
+            New-PolicyRecord -Node $Node -Assignment $null -Policy $p -PolicyId $p.id -RoleDefinitionId ''
+        }
+    }
+    $missingRuleRecords = @($Node.Policies | Where-Object { $_.Rules.Count -eq 0 }).Count
+    if ($missingRuleRecords -gt 0) {
+        Add-ReportError -ScopeId $scope -Operation 'Missing rule payloads' -Message "$missingRuleRecords policy records lack their rule payload."
+    }
+    if (-not $assignmentsOK -or -not $policiesOK -or $missingRuleRecords -gt 0) { $Node.Status = 'PARTIAL / ERROR' }
+    elseif ($Node.Policies.Count -eq 0) { $Node.Status = 'No policies returned' }
+    else { $Node.Status = 'OK' }
+}
+
+function Resolve-RoleName {
+    param([string] $RoleDefinitionId)
+    if (-not $RoleDefinitionId) { return '[Unmapped policy]' }
+    $guid = ($RoleDefinitionId.TrimEnd('/') -split '/')[-1]
+    if ($script:RoleNames.ContainsKey($guid)) { return $script:RoleNames[$guid] }
+    if ($NoRoleNameResolution) {
+        $script:RoleNames[$guid] = $guid
+        return $guid
+    }
+    $name = $guid
+    try {
+        $role = Invoke-ArmJson -Path ('{0}?api-version=2022-04-01' -f $RoleDefinitionId.TrimEnd('/'))
+        if ($role.properties.roleName) { $name = [string] $role.properties.roleName }
+    }
+    catch {
+        # Non-critical: the unambiguous role-definition GUID is retained.
+        Write-Verbose "Role-name lookup failed for $RoleDefinitionId : $($_.Exception.Message)"
+    }
+    $script:RoleNames[$guid] = $name
+    return $name
+}
+
+function Get-DisplayChildren {
+    param($Node)
+    foreach ($c in @($Node.Children | Sort-Object @{ Expression = {
+        switch ($_.Kind) {
+            'ManagementGroup' { 0 }
+            'Subscription' { 1 }
+            'ResourceGroup' { 2 }
+            default { 3 }
+        }
+    } }, Name)) {
+        if ($c.Kind -in @('ManagementGroup', 'Subscription')) { Write-Output $c; continue }
+        if ($c.Policies.Count -gt 0 -or $c.Status -match 'ERROR') { Write-Output $c; continue }
+        if ($c.Kind -eq 'ResourceGroup') {
+            $hasVisibleDescendant = @($c.Children | Where-Object { $_.Policies.Count -gt 0 -or $_.Status -match 'ERROR' }).Count -gt 0
+            if ($hasVisibleDescendant) { Write-Output $c }
+        }
+    }
+}
+
+function Get-PolicyLine {
+    param($Record)
+    $s = $Record.Summary
+    return ('Activation: max={0}; MFA={1}; justification={2}; ticket={3}; approval={4}; CA context={5}; Eligible: permanent={6}, max={7}; Active: permanent={8}, max={9}; notification rules={10}' -f
+        $(if ($s.ActivationMaxDuration) { $s.ActivationMaxDuration } else { '?' }),
+        (Bool-Text $s.ActivationMFA), (Bool-Text $s.ActivationJustification), (Bool-Text $s.ActivationTicket),
+        (Bool-Text $s.ActivationApproval), (Bool-Text $s.ConditionalAccessContextEnabled),
+        (Bool-Text $s.EligiblePermanentAllowed), $(if ($s.EligibleMaxDuration) { $s.EligibleMaxDuration } else { '?' }),
+        (Bool-Text $s.ActivePermanentAllowed), $(if ($s.ActiveMaxDuration) { $s.ActiveMaxDuration } else { '?' }),
+        $s.NotificationRuleCount)
+}
+
+function Add-TextTree {
+    param($Node, [string] $Prefix = '', [bool] $IsLast = $true, [bool] $IsRoot = $false)
+    $connector = if ($IsRoot) { '' } elseif ($IsLast) { '+-- ' } else { '|-- ' }
+    $label = '[{0}] {1} ({2}) : {3} policies [{4}]' -f $Node.Kind, $Node.Name, $Node.Id, $Node.Policies.Count, $Node.Status
+    [void] $script:Txt.AppendLine("$Prefix$connector$label")
+    $nextPrefix = if ($IsRoot) { '' } elseif ($IsLast) { "$Prefix    " } else { "$Prefix|   " }
+
+    $items = [System.Collections.Generic.List[object]]::new()
+    foreach ($p in @($Node.Policies | Sort-Object RoleName, PolicyId)) {
+        [void] $items.Add([pscustomobject] @{ Type = 'Policy'; Value = $p })
+    }
+    foreach ($c in @(Get-DisplayChildren -Node $Node)) {
+        [void] $items.Add([pscustomobject] @{ Type = 'Scope'; Value = $c })
+    }
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $item = $items[$i]
+        $last = $i -eq ($items.Count - 1)
+        if ($item.Type -eq 'Scope') {
+            Add-TextTree -Node $item.Value -Prefix $nextPrefix -IsLast $last
+        }
+        else {
+            $branch = if ($last) { '+-- ' } else { '|-- ' }
+            [void] $script:Txt.AppendLine("$nextPrefix$branch[Role] $($item.Value.RoleName)")
+            $rulePrefix = if ($last) { "$nextPrefix    " } else { "$nextPrefix|   " }
+            [void] $script:Txt.AppendLine("$rulePrefix$(Get-PolicyLine -Record $item.Value)")
+            if ($item.Value.Summary.ApprovalApprovers) {
+                [void] $script:Txt.AppendLine("${rulePrefix}Approvers: $($item.Value.Summary.ApprovalApprovers)")
+            }
+            if ($item.Value.Summary.ConditionalAccessContextEnabled -eq $true) {
+                [void] $script:Txt.AppendLine("${rulePrefix}Authentication context ID: $($item.Value.Summary.ConditionalAccessContextId)")
+            }
+        }
+    }
+}
+
+function Html {
+    param($Value)
+    return [System.Net.WebUtility]::HtmlEncode([string] $Value)
+}
+
+function Add-HtmlTree {
+    param($Node, [int] $Depth = 0)
+    $open = if ($Depth -lt 2) { ' open' } else { '' }
+    $caption = '[{0}] {1} - {2} policies [{3}]' -f $Node.Kind, $Node.Name, $Node.Policies.Count, $Node.Status
+    [void] $script:HtmlBody.AppendLine("<details class='scope'$open><summary>$(Html $caption)</summary>")
+    [void] $script:HtmlBody.AppendLine("<div class='id'>$(Html $Node.Id)</div>")
+    foreach ($p in @($Node.Policies | Sort-Object RoleName, PolicyId)) {
+        [void] $script:HtmlBody.AppendLine('<details class="role"><summary>' + (Html ($p.RoleName + ' | ' + (Get-PolicyLine -Record $p))) + '</summary>')
+        [void] $script:HtmlBody.AppendLine("<div class='id'>Policy: $(Html $p.PolicyId)</div>")
+        [void] $script:HtmlBody.AppendLine('<div class="id">Complete ARM rules (effective where provided):</div>')
+        $raw = ConvertTo-Json -InputObject $p.Rules -Depth 100
+        [void] $script:HtmlBody.AppendLine('<pre>' + (Html $raw) + '</pre></details>')
+    }
+    foreach ($child in @(Get-DisplayChildren -Node $Node)) { Add-HtmlTree -Node $child -Depth ($Depth + 1) }
+    [void] $script:HtmlBody.AppendLine('</details>')
+}
+
+# 1. Management group tree (ARM produces nested children with one request).
+$mgPath = '/providers/Microsoft.Management/managementGroups/{0}?api-version=2020-05-01&$expand=children&$recurse=true' -f [uri]::EscapeDataString($ManagementGroupId)
+try { $mg = Invoke-ArmJson -Path $mgPath }
+catch { throw "Cannot read starting management group '$ManagementGroupId'. Check tenant/context and Reader permissions. $($_.Exception.Message)" }
 $rootName = if ($mg.properties.displayName) { [string] $mg.properties.displayName } else { $mg.name }
 $script:RootNode = Add-Node -Id $mg.id -Name $rootName -Kind 'ManagementGroup'
 Add-ManagementGroupChildren -Children $mg.properties.children -ParentId $script:RootNode.Id
