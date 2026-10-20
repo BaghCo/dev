@@ -7,6 +7,10 @@
     Discovers the management-group / subscription tree, lists role management policy
     assignments and the corresponding role management policies at each scope,
     and saves a collapsible HTML tree, text tree, summary CSV, rule CSV and JSON.
+    Diagnostics are written during scanning as well as in the final report.
+    A 404 on a resource-group PIM API is checked against the resource-group GET
+    endpoint before calling that group missing; failed scopes are not counted
+    as empty configuration.
 
     Coverage defaults to management groups and subscriptions. Choose ResourceGroups
     or Resources to examine those levels too. Individual resources can cause a
@@ -20,11 +24,14 @@
     Does not enumerate PIM eligible or active *principal* assignments.
 .EXAMPLE
     Connect-AzAccount -Tenant '<tenant-guid>'
-    ./Get-AzurePimPolicyTree.ps1
+    ./Get-AzurePimPolicyTree-v3.ps1
 .EXAMPLE
-    ./Get-AzurePimPolicyTree.ps1 -ManagementGroupId 'platform' -ScopeDepth ResourceGroups
+    ./Get-AzurePimPolicyTree-v3.ps1 -ManagementGroupId 'platform' -ScopeDepth ResourceGroups
 .EXAMPLE
-    ./Get-AzurePimPolicyTree.ps1 -ScopeDepth Resources -OutputDirectory ./PimFull -FailOnErrors
+    ./Get-AzurePimPolicyTree-v3.ps1 -ScopeDepth Resources -OutputDirectory ./PimFull -FailOnErrors
+.EXAMPLE
+    ./Get-AzurePimPolicyTree-v3.ps1 -SubscriptionId (Get-AzContext).Subscription.Id
+    # Bypass management-group enumeration to verify an accessible subscription.
 .NOTES
     Requires Az.Accounts and an authenticated Azure context in the target tenant.
     Grant Reader access on the starting management group and its descendants,
@@ -33,11 +40,13 @@
 [CmdletBinding()]
 param(
     [string] $ManagementGroupId,
+    [string] $SubscriptionId,
     [ValidateSet('ManagementGroupsAndSubscriptions', 'ResourceGroups', 'Resources')]
     [string] $ScopeDepth = 'ManagementGroupsAndSubscriptions',
     [string] $OutputDirectory = (Join-Path (Get-Location).Path 'AzurePimReport'),
     [switch] $NoRoleNameResolution,
-    [switch] $FailOnErrors
+    [switch] $FailOnErrors,
+    [switch] $AllowEmpty
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,7 +55,13 @@ $context = Get-AzContext
 if (-not $context -or -not $context.Tenant -or -not $context.Tenant.Id) {
     throw 'No Azure context. Run Connect-AzAccount -Tenant <tenant-id> first.'
 }
-if ([string]::IsNullOrWhiteSpace($ManagementGroupId)) {
+if ($SubscriptionId -and $ManagementGroupId) {
+    throw 'Choose one starting scope: -ManagementGroupId or -SubscriptionId.'
+}
+if ($SubscriptionId -and $SubscriptionId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+    throw 'SubscriptionId must be the subscription GUID (without /subscriptions/).'
+}
+if (-not $SubscriptionId -and [string]::IsNullOrWhiteSpace($ManagementGroupId)) {
     $ManagementGroupId = [string] $context.Tenant.Id
 }
 
@@ -54,8 +69,53 @@ $script:Nodes = @{}
 $script:AllNodes = [System.Collections.Generic.List[object]]::new()
 $script:AllPolicies = [System.Collections.Generic.List[object]]::new()
 $script:Errors = [System.Collections.Generic.List[object]]::new()
+$script:Requests = [System.Collections.Generic.List[object]]::new()
 $script:RoleNames = @{}
 $script:RootNode = $null
+
+# Write diagnostics immediately so a failed or interrupted run still leaves evidence.
+# These are separate from the final *_requests.csv, *_errors.csv and *_scopes.csv.
+[void] (New-Item -ItemType Directory -Path $OutputDirectory -Force -ErrorAction Stop)
+$out = (Resolve-Path -Path $OutputDirectory -ErrorAction Stop).Path
+$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$stem = Join-Path $out "AzurePim_$stamp"
+$script:LiveRequestsPath = "${stem}_requests.live.csv"
+$script:LiveErrorsPath = "${stem}_errors.live.csv"
+$script:LiveScopesPath = "${stem}_scopes.live.csv"
+$script:LivePoliciesPath = "${stem}_policies.partial.jsonl"
+"Path,Result,ItemCount,Error" | Set-Content -Path $script:LiveRequestsPath -Encoding utf8
+"ScopeId,Operation,Error" | Set-Content -Path $script:LiveErrorsPath -Encoding utf8
+"ScopeId,ScopeKind,Status,AssignmentCount,PolicyCount,PolicyRecords" | Set-Content -Path $script:LiveScopesPath -Encoding utf8
+[System.IO.File]::WriteAllText($script:LivePoliciesPath, '')
+Write-Host "PIM collection started. Live diagnostics: $out" -ForegroundColor Cyan
+
+function Write-LiveCsvRow {
+    param([string] $Path, [object] $Row)
+    # The headers above are created before scanning. Export-Csv -Append never
+    # treats a failed scope as a successful zero-record result.
+    $Row | Export-Csv -Path $Path -NoTypeInformation -Encoding utf8 -Append -ErrorAction Stop
+}
+
+function Add-RequestRecord {
+    param([string] $Path, [string] $Result, $ItemCount, [string] $Message = '')
+    $record = [pscustomobject] @{
+        Path = $Path; Result = $Result; ItemCount = $ItemCount; Error = $Message
+    }
+    [void] $script:Requests.Add($record)
+    Write-LiveCsvRow -Path $script:LiveRequestsPath -Row $record
+}
+
+function Write-ScopeRecord {
+    param($Node)
+    Write-LiveCsvRow -Path $script:LiveScopesPath -Row ([pscustomobject] @{
+        ScopeId = $Node.Id
+        ScopeKind = $Node.Kind
+        Status = $Node.Status
+        AssignmentCount = $Node.ApiAssignmentCount
+        PolicyCount = $Node.ApiPolicyCount
+        PolicyRecords = $Node.Policies.Count
+    })
+}
 
 function Invoke-ArmJson {
     param([Parameter(Mandatory)][string] $Path)
@@ -88,6 +148,7 @@ function Invoke-ArmJson {
             try {
                 $serverError = ConvertFrom-Json -InputObject $detail -Depth 100
                 if ($serverError.error.message) { $detail = $serverError.error.message }
+                if ($serverError.error.code) { $detail = "[$($serverError.error.code)] $detail" }
             }
             catch { }
             throw "ARM GET $status for ${Path}: $detail"
@@ -105,18 +166,30 @@ function Get-ArmList {
     while (-not [string]::IsNullOrWhiteSpace($next)) {
         if ($seenLinks.ContainsKey($next)) { throw "Repeated ARM continuation link: $next" }
         $seenLinks[$next] = $true
-        $result = Invoke-ArmJson -Path $next
-        if ($null -eq $result -or $null -eq $result.PSObject.Properties['value']) { throw "Unexpected ARM list result (missing value): $next" }
-        foreach ($item in @($result.value)) { if ($null -ne $item) { Write-Output $item } }
+        try {
+            $result = Invoke-ArmJson -Path $next
+            if ($null -eq $result -or $null -eq $result.PSObject.Properties['value']) {
+                throw "Unexpected ARM list result (missing value): $next"
+            }
+            $items = @($result.value | Where-Object { $null -ne $_ })
+            Add-RequestRecord -Path $next -Result 'OK' -ItemCount $items.Count
+        }
+        catch {
+            Add-RequestRecord -Path $next -Result 'FAILED' -ItemCount $null -Message $_.Exception.Message
+            throw
+        }
+        foreach ($item in $items) { Write-Output $item }
         $next = [string] $result.nextLink
     }
 }
 
 function Add-ReportError {
     param([string] $ScopeId, [string] $Operation, [string] $Message)
-    [void] $script:Errors.Add([pscustomobject] @{
+    $record = [pscustomobject] @{
         ScopeId = $ScopeId; Operation = $Operation; Error = $Message
-    })
+    }
+    [void] $script:Errors.Add($record)
+    Write-LiveCsvRow -Path $script:LiveErrorsPath -Row $record
     Write-Warning "[$Operation] ${ScopeId}: $Message"
 }
 
@@ -132,6 +205,10 @@ function Add-Node {
         Children = [System.Collections.Generic.List[object]]::new()
         Policies = [System.Collections.Generic.List[object]]::new()
         Status = 'Not scanned'
+        ApiAssignmentCount = $null
+        ApiPolicyCount = $null
+        FilteredAssignmentCount = 0
+        FilteredPolicyCount = 0
     }
     $script:Nodes[$Id] = $node
     [void] $script:AllNodes.Add($node)
@@ -159,6 +236,38 @@ function Add-ManagementGroupChildren {
         if ($kind -eq 'ManagementGroup') {
             Add-ManagementGroupChildren -Children $child.children -ParentId $child.id
         }
+    }
+}
+
+function Test-ArmNotFoundMessage {
+    param([string] $Message)
+    # Invoke-AzRestMethod may return a response or throw, depending on version.
+    # Match common 404/status phrases without confusing a scope name ending in 404
+    # for an HTTP result.
+    return [bool] ($Message -match '(?i)(ARM GET\s+404\b|\bHTTP\s*404\b|\bstatus(?:\s*code)?\s*[:=]?\s*404\b|\b404\s+Not\s+Found\b|\bResourceGroupNotFound\b)')
+}
+
+function Test-ResourceGroupAfter404 {
+    param([Parameter(Mandatory)][string] $ScopeId)
+    # Only call this following a 404 from a PIM endpoint. The RG list was
+    # already retrieved from ARM, but a RG can be deleted during a long scan.
+    # 404 for *the policy endpoint* is not by itself proof the RG is missing.
+    $path = '{0}?api-version=2021-04-01' -f $ScopeId.TrimEnd('/')
+    try {
+        $rg = Invoke-ArmJson -Path $path
+        Add-RequestRecord -Path $path -Result 'OK' -ItemCount 1
+        if ($null -ne $rg -and ([string] $rg.id).TrimEnd('/') -ieq $ScopeId.TrimEnd('/')) {
+            return 'Exists'
+        }
+        Add-ReportError -ScopeId $ScopeId -Operation 'Verify resource group' -Message 'Resource-group GET returned unexpected content.'
+        return 'Unknown'
+    }
+    catch {
+        $message = $_.Exception.Message
+        Add-RequestRecord -Path $path -Result 'FAILED' -ItemCount $null -Message $message
+        if (Test-ArmNotFoundMessage -Message $message) { return 'Missing' }
+        Add-ReportError -ScopeId $ScopeId -Operation 'Verify resource group' -Message "Could not confirm resource-group existence: $message"
+        return 'Unknown'
     }
 }
 
@@ -258,6 +367,10 @@ function New-PolicyRecord {
     }
     [void] $Node.Policies.Add($record)
     [void] $script:AllPolicies.Add($record)
+    # Preserve the actual rule payload before the final HTML/CSV export.
+    # JSONL is valid even if collection stops before the last scope.
+    $jsonLine = ConvertTo-Json -InputObject $record -Depth 60 -Compress
+    Add-Content -Path $script:LivePoliciesPath -Value $jsonLine -Encoding utf8 -ErrorAction Stop
 }
 
 function Read-ScopePolicies {
@@ -266,21 +379,54 @@ function Read-ScopePolicies {
     $scope = $Node.Id
     $assignments = @()
     $policies = @()
-    $assignmentsOK = $true
-    $policiesOK = $true
+    $assignmentsOK = $false
+    $policiesOK = $false
+    $rgExistence = 'NotChecked'
+    $assignmentPath = '{0}/providers/Microsoft.Authorization/roleManagementPolicyAssignments?api-version=2020-10-01' -f $scope
+    $policyPath = '{0}/providers/Microsoft.Authorization/roleManagementPolicies?api-version=2020-10-01' -f $scope
+
     try {
-        $assignments = @(Get-ArmList -Path ('{0}/providers/Microsoft.Authorization/roleManagementPolicyAssignments?api-version=2020-10-01' -f $scope))
+        $assignments = @(Get-ArmList -Path $assignmentPath)
+        $assignmentsOK = $true
+        $Node.ApiAssignmentCount = $assignments.Count
     }
     catch {
-        $assignmentsOK = $false
-        Add-ReportError -ScopeId $scope -Operation 'List policy assignments' -Message $_.Exception.Message
+        $message = $_.Exception.Message
+        if ($Node.Kind -eq 'ResourceGroup' -and (Test-ArmNotFoundMessage -Message $message)) {
+            $rgExistence = Test-ResourceGroupAfter404 -ScopeId $scope
+            if ($rgExistence -eq 'Missing') {
+                $Node.Status = 'MISSING / ERROR'
+                Add-ReportError -ScopeId $scope -Operation 'Resource group missing since enumeration' -Message "Resource-group GET also returned 404. The group was listed earlier but is now missing; PIM settings not assessed. Original error: $message"
+                return
+            }
+            if ($rgExistence -eq 'Exists') {
+                $message = "PIM policy-assignment endpoint returned 404 although the resource group exists. $message"
+            }
+        }
+        Add-ReportError -ScopeId $scope -Operation 'List policy assignments' -Message $message
     }
+
     try {
-        $policies = @(Get-ArmList -Path ('{0}/providers/Microsoft.Authorization/roleManagementPolicies?api-version=2020-10-01' -f $scope))
+        $policies = @(Get-ArmList -Path $policyPath)
+        $policiesOK = $true
+        $Node.ApiPolicyCount = $policies.Count
     }
     catch {
-        $policiesOK = $false
-        Add-ReportError -ScopeId $scope -Operation 'List policies' -Message $_.Exception.Message
+        $message = $_.Exception.Message
+        if ($Node.Kind -eq 'ResourceGroup' -and (Test-ArmNotFoundMessage -Message $message)) {
+            if ($rgExistence -eq 'NotChecked') {
+                $rgExistence = Test-ResourceGroupAfter404 -ScopeId $scope
+            }
+            if ($rgExistence -eq 'Missing') {
+                $Node.Status = 'MISSING / ERROR'
+                Add-ReportError -ScopeId $scope -Operation 'Resource group missing since enumeration' -Message "Resource-group GET also returned 404. The group was listed earlier but is now missing; PIM settings not assessed. Original error: $message"
+                return
+            }
+            if ($rgExistence -eq 'Exists') {
+                $message = "PIM policy endpoint returned 404 although the resource group exists. $message"
+            }
+        }
+        Add-ReportError -ScopeId $scope -Operation 'List policies' -Message $message
     }
 
     # Some list operations can include policy objects belonging to a different scope.
@@ -288,6 +434,7 @@ function Read-ScopePolicies {
     $policies = @($policies | Where-Object {
         -not $_.properties.scope -or ([string] $_.properties.scope).TrimEnd('/') -ieq $scope.TrimEnd('/')
     })
+    if ($policiesOK) { $Node.FilteredPolicyCount = $Node.ApiPolicyCount - $policies.Count }
     $byId = @{}
     foreach ($p in $policies) {
         if ($p.id) { $byId[[string] $p.id.TrimEnd('/')] = $p }
@@ -297,7 +444,7 @@ function Read-ScopePolicies {
         if ($null -eq $a -or $null -eq $a.properties) { continue }
         $assignmentScope = [string] $a.properties.scope
         if ($assignmentScope -and $assignmentScope.TrimEnd('/') -ine $scope.TrimEnd('/')) {
-            # Never label a policy on another scope as a locally configured policy.
+            $Node.FilteredAssignmentCount++
             continue
         }
         $policyId = [string] $a.properties.policyId
@@ -319,7 +466,6 @@ function Read-ScopePolicies {
     }
     foreach ($p in $policies) {
         if ($p.id -and -not $matched.ContainsKey(([string] $p.id).TrimEnd('/'))) {
-            # Include policies that cannot be mapped to a role, rather than silently dropping them.
             New-PolicyRecord -Node $Node -Assignment $null -Policy $p -PolicyId $p.id -RoleDefinitionId ''
         }
     }
@@ -328,7 +474,7 @@ function Read-ScopePolicies {
         Add-ReportError -ScopeId $scope -Operation 'Missing rule payloads' -Message "$missingRuleRecords policy records lack their rule payload."
     }
     if (-not $assignmentsOK -or -not $policiesOK -or $missingRuleRecords -gt 0) { $Node.Status = 'PARTIAL / ERROR' }
-    elseif ($Node.Policies.Count -eq 0) { $Node.Status = 'No policies returned' }
+    elseif ($Node.Policies.Count -eq 0) { $Node.Status = 'Zero local policies returned (unverified)' }
     else { $Node.Status = 'OK' }
 }
 
@@ -442,13 +588,21 @@ function Add-HtmlTree {
     [void] $script:HtmlBody.AppendLine('</details>')
 }
 
-# 1. Management group tree (ARM produces nested children with one request).
-$mgPath = '/providers/Microsoft.Management/managementGroups/{0}?api-version=2020-05-01&$expand=children&$recurse=true' -f [uri]::EscapeDataString($ManagementGroupId)
-try { $mg = Invoke-ArmJson -Path $mgPath }
-catch { throw "Cannot read starting management group '$ManagementGroupId'. Check tenant/context and Reader permissions. $($_.Exception.Message)" }
-$rootName = if ($mg.properties.displayName) { [string] $mg.properties.displayName } else { $mg.name }
-$script:RootNode = Add-Node -Id $mg.id -Name $rootName -Kind 'ManagementGroup'
-Add-ManagementGroupChildren -Children $mg.properties.children -ParentId $script:RootNode.Id
+# 1. Discover the hierarchy, or explicitly target a single subscription to diagnose access.
+if ($SubscriptionId) {
+    $script:RootNode = Add-Node -Id "/subscriptions/$SubscriptionId" -Name $SubscriptionId -Kind 'Subscription'
+}
+else {
+    $mgPath = '/providers/Microsoft.Management/managementGroups/{0}?api-version=2020-05-01&$expand=children&$recurse=true' -f [uri]::EscapeDataString($ManagementGroupId)
+    try { $mg = Invoke-ArmJson -Path $mgPath }
+    catch { throw "Cannot read starting management group '$ManagementGroupId'. Check tenant/context and Reader permissions. $($_.Exception.Message)" }
+    $rootName = if ($mg.properties.displayName) { [string] $mg.properties.displayName } else { $mg.name }
+    $script:RootNode = Add-Node -Id $mg.id -Name $rootName -Kind 'ManagementGroup'
+    Add-ManagementGroupChildren -Children $mg.properties.children -ParentId $script:RootNode.Id
+    if ($script:AllNodes.Count -eq 1) {
+        Write-Warning 'Only the starting management group was returned. This can be a visibility/scope problem; the report does not establish tenant-wide coverage.'
+    }
+}
 
 # 2. Discover deeper scopes only when requested. Keep the tree even if enumeration fails.
 if ($ScopeDepth -ne 'ManagementGroupsAndSubscriptions') {
@@ -485,7 +639,18 @@ if ($ScopeDepth -ne 'ManagementGroupsAndSubscriptions') {
 }
 
 # 3. Query both policy-to-role associations and policy rules, at EACH distinct scope.
-foreach ($node in $script:AllNodes) { Read-ScopePolicies -Node $node }
+foreach ($node in @($script:AllNodes.ToArray())) {
+    try {
+        Read-ScopePolicies -Node $node
+    }
+    catch {
+        $node.Status = 'PARTIAL / ERROR'
+        Add-ReportError -ScopeId $node.Id -Operation 'Unexpected scope processing exception' -Message $_.Exception.Message
+    }
+    finally {
+        Write-ScopeRecord -Node $node
+    }
+}
 Write-Progress -Activity 'Reading Azure PIM settings' -Completed
 
 # 4. Resolve role names once per unique role-definition GUID.
@@ -494,13 +659,9 @@ foreach ($p in $script:AllPolicies) {
 }
 
 # 5. Emit auditable local files.
-[void] (New-Item -ItemType Directory -Force -Path $OutputDirectory)
-$out = (Resolve-Path -Path $OutputDirectory).Path
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$stem = Join-Path $out "AzurePim_$stamp"
-
 $script:Txt = [System.Text.StringBuilder]::new()
-[void] $script:Txt.AppendLine("Azure resource PIM settings | tenant=$($context.Tenant.Id) | root MG=$ManagementGroupId | coverage=$ScopeDepth | generated UTC=$([datetime]::UtcNow.ToString('o'))")
+$reportRoot = $(if ($SubscriptionId) { "subscription=$SubscriptionId" } else { "root MG=$ManagementGroupId" })
+[void] $script:Txt.AppendLine("Azure resource PIM settings | tenant=$($context.Tenant.Id) | $reportRoot | coverage=$ScopeDepth | generated UTC=$([datetime]::UtcNow.ToString('o'))")
 [void] $script:Txt.AppendLine('PIM role settings are independent per Azure scope. Tree position does NOT indicate settings inheritance.')
 [void] $script:Txt.AppendLine('A question mark means a required rule was not returned; consult the raw rules JSON for all details.')
 [void] $script:Txt.AppendLine()
@@ -518,7 +679,7 @@ summary{cursor:pointer;font-weight:600;overflow-wrap:anywhere}.role{border-left-
 .id{font-size:11px;color:#536176;overflow-wrap:anywhere;margin:4px 0 7px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.4 Consolas,monospace;background:#eef2f6;padding:12px;border-radius:5px}
 </style></head><body><h1>Azure resource PIM role settings</h1>
 '@
-$htmlPage += '<p>' + (Html "Tenant $($context.Tenant.Id). Starting management group: $ManagementGroupId. Coverage: $ScopeDepth. Generated UTC: $([datetime]::UtcNow.ToString('o')).") + '</p>'
+$htmlPage += '<p>' + (Html "Tenant $($context.Tenant.Id). Starting scope: $reportRoot. Coverage: $ScopeDepth. Generated UTC: $([datetime]::UtcNow.ToString('o')).") + '</p>'
 $htmlPage += '<p>Scopes are displayed hierarchically; PIM role settings do not inherit. Expand a role to see every effective ARM rule, including approvers and notifications. Lower-level scopes without returned policies are hidden unless they have errors. See the CSV and JSON for the full inventory.</p>'
 $htmlPage += $script:HtmlBody.ToString() + '</body></html>'
 [System.IO.File]::WriteAllText("${stem}_tree.html", $htmlPage, [System.Text.UTF8Encoding]::new($true))
@@ -546,7 +707,7 @@ $summaryRows = foreach ($p in $script:AllPolicies) {
 if (@($summaryRows | Where-Object { $null -ne $_ }).Count -gt 0) {
     $summaryRows | Export-Csv -Path "${stem}_policies.csv" -NoTypeInformation -Encoding utf8
 } else {
-    Set-Content -Path "${stem}_policies.csv" -Value 'No policy records returned. Consult scopes and errors in the JSON inventory.' -Encoding utf8
+    Set-Content -Path "${stem}_policies.csv" -Value 'ScopeKind,ScopeName,ScopeId,RoleName,RoleDefinitionId,PolicyId,IsOrganisationDefault,LastModified,ActivationMaxDuration,ActivationMFA,ActivationJustification,ActivationTicket,ActivationApproval,ApprovalApprovers,ConditionalAccessContextEnabled,ConditionalAccessContextId,EligiblePermanentAllowed,EligibleMaxDuration,ActivePermanentAllowed,ActiveMaxDuration,NotificationRuleCount' -Encoding utf8
 }
 
 $ruleRows = foreach ($p in $script:AllPolicies) {
@@ -563,23 +724,36 @@ $ruleRows = foreach ($p in $script:AllPolicies) {
 if (@($ruleRows | Where-Object { $null -ne $_ }).Count -gt 0) {
     $ruleRows | Export-Csv -Path "${stem}_rules.csv" -NoTypeInformation -Encoding utf8
 } else {
-    Set-Content -Path "${stem}_rules.csv" -Value 'No rule records returned. Consult scopes and errors in the JSON inventory.' -Encoding utf8
+    Set-Content -Path "${stem}_rules.csv" -Value 'ScopeId,ScopeName,RoleName,PolicyId,RuleId,RuleType,Caller,Level,RuleJson' -Encoding utf8
 }
 
 $inventory = [pscustomobject] @{
     TenantId = [string] $context.Tenant.Id
     StartingManagementGroup = $ManagementGroupId
+    StartingSubscription = $SubscriptionId
     ScopeDepth = $ScopeDepth
     GeneratedUtc = [datetime]::UtcNow.ToString('o')
     CollectionErrors = $script:Errors.Count
-    PolicySettingsCompleteForScannedScopes = ($script:Errors.Count -eq 0)
+    RG404Verification = 'RG existence checked only after a PIM endpoint 404; policy API 404 alone is not evidence that an RG is absent.' 
+    PolicySettingsCompleteForScannedScopes = ($script:Errors.Count -eq 0 -and $script:AllPolicies.Count -gt 0)
+    Warning = $(if ($script:AllPolicies.Count -eq 0) { 'Zero PIM settings obtained. Do not interpret this as evidence that PIM is unconfigured.' } else { $null })
     Scopes = @(foreach ($n in $script:AllNodes) {
-        [pscustomobject] @{ Id = $n.Id; ParentId = $n.ParentId; Kind = $n.Kind; Name = $n.Name; Status = $n.Status; PolicyCount = $n.Policies.Count }
+        [pscustomobject] @{
+            Id = $n.Id; ParentId = $n.ParentId; Kind = $n.Kind; Name = $n.Name
+            Status = $n.Status; PolicyCount = $n.Policies.Count
+            ApiAssignmentCount = $n.ApiAssignmentCount; ApiPolicyCount = $n.ApiPolicyCount
+            FilteredAssignmentCount = $n.FilteredAssignmentCount; FilteredPolicyCount = $n.FilteredPolicyCount
+        }
     })
     Policies = @($script:AllPolicies.ToArray())
+    Requests = @($script:Requests.ToArray())
     Errors = @($script:Errors.ToArray())
 }
 $inventory | ConvertTo-Json -Depth 100 | Set-Content -Path "${stem}_full.json" -Encoding utf8
+$inventory.Scopes | Export-Csv -Path "${stem}_scopes.csv" -NoTypeInformation -Encoding utf8
+if ($script:Requests.Count -gt 0) {
+    $script:Requests.ToArray() | Export-Csv -Path "${stem}_requests.csv" -NoTypeInformation -Encoding utf8
+}
 if ($script:Errors.Count -gt 0) {
     $script:Errors.ToArray() | Export-Csv -Path "${stem}_errors.csv" -NoTypeInformation -Encoding utf8
 } else {
@@ -593,7 +767,20 @@ Write-Host "Tree: ${stem}_tree.html"
 Write-Host "Text: ${stem}_tree.txt"
 Write-Host "Policies: ${stem}_policies.csv; rules: ${stem}_rules.csv"
 Write-Host "Raw JSON: ${stem}_full.json; errors: ${stem}_errors.csv"
+Write-Host "Diagnostics: ${stem}_scopes.csv; ${stem}_requests.csv"
+Write-Host "During-scan journals: ${stem}_scopes.live.csv; ${stem}_requests.live.csv; ${stem}_errors.live.csv"
+Write-Host "Durable partial policy data: ${stem}_policies.partial.jsonl"
+$discoveredSubs = @($script:AllNodes | Where-Object { $_.Kind -eq 'Subscription' }).Count
+Write-Host "Subscription scopes discovered: $discoveredSubs"
 if ($script:Errors.Count -gt 0) {
     Write-Warning 'Report is INCOMPLETE. Review errors.csv and the coverage setting before using it for audit decisions.'
-    if ($FailOnErrors) { throw "$($script:Errors.Count) ARM errors; report incomplete. Files were saved." }
+}
+if ($script:AllPolicies.Count -eq 0) {
+    Write-Warning 'ZERO POLICIES RETRIEVED. Do not use this report as evidence that PIM is absent. Check scopes.csv, requests.csv and test one known accessible subscription with the Az.Resources cmdlets.'
+    if (-not $AllowEmpty) {
+        throw 'No PIM role policies were retrieved. Diagnostic files were saved. Use -AllowEmpty only if an empty scan is expected.'
+    }
+}
+if ($script:Errors.Count -gt 0 -and $FailOnErrors) {
+    throw "$($script:Errors.Count) ARM errors; report incomplete. Diagnostic files were saved."
 }
