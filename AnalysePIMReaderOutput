@@ -28,3 +28,29 @@ $file = Get-ChildItem $folder -Filter "*_errors.live.csv" |
 Import-Csv $file.FullName |
     Select-Object -Last 10 |
     Format-List
+
+# owner check
+$journal = Get-ChildItem '.\AzurePimReport' `
+    -Filter '*_policies.partial.jsonl' |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+$owner = '8e3af657-a8ff-443c-a75c-2fe8c4bcb635'
+
+Get-Content $journal.FullName -TotalCount 5000 |
+    ForEach-Object { $_ | ConvertFrom-Json -Depth 100 } |
+    Where-Object RoleDefinitionGuid -EQ $owner |
+    Select-Object -First 5 `
+        ScopeKind, ScopeName, IsOrganisationDefault,
+        @{N='ReportedMFA'; E={$_.Summary.ActivationMFA}},
+        @{N='RawMFAFlags'; E={
+            (@($_.Rules |
+                Where-Object id -EQ 'Enablement_EndUser_Assignment' |
+                ForEach-Object { $_.enabledRules }) -join ', ')
+        }},
+        @{N='PolicyEffectiveFlags'; E={
+            (@($_.PolicyRaw.properties.effectiveRules |
+                Where-Object id -EQ 'Enablement_EndUser_Assignment' |
+                ForEach-Object { $_.enabledRules }) -join ', ')
+        }} |
+    Format-List
