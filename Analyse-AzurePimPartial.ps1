@@ -2,6 +2,7 @@
 <#
 .SYNOPSIS
     Offline, streaming analysis of Get-AzurePimPolicyTree-v4.ps1's partial JSONL journal.
+    v2 fixes progress calculations for input journals larger than 2 GB.
 .DESCRIPTION
     Does not sign in to Azure or make API requests. Reads one JSONL record at a time,
     with FileShare.ReadWrite, so it can analyse an unfinished journal while the
@@ -345,7 +346,15 @@ try {
                 $settingsWriter.Flush()
                 $findingsWriter.Flush()
                 Write-Host ("Processed {0:N0} distinct policy records across {1:N0} scopes; findings for review: {2:N0}" -f $records,$scopes.Count,$findingsCount)
-                $progressPct = [math]::Min(99, [int](100.0 * $stream.Position / [math]::Max(1,$startingBytes)))
+                # Both FileStream.Position and Length are Int64. With a journal
+                # larger than 2 GB, [math]::Max(1, $startingBytes) can select
+                # the Int32 overload and throw. Use Double arithmetic, with an
+                # explicit zero-length guard. This is an approximate snapshot
+                # progress value (StreamReader buffers data).
+                $progressPct = 0
+                if ($startingBytes -gt 0) {
+                    $progressPct = [int][math]::Min(99.0, (100.0 * [double]$stream.Position / [double]$startingBytes))
+                }
                 Write-Progress -Activity 'Offline PIM policy analysis' -Status "$records records analysed" -PercentComplete $progressPct
             }
             if ($MaxRecords -gt 0 -and $records -ge $MaxRecords) { break }
@@ -377,7 +386,7 @@ try {
         $role = $roles[$v.RoleKey]
         $largest = $largestByRole[$v.RoleKindKey]
         $kindRecords = $roleKindCounts[$v.RoleKindKey]
-        $pct = [math]::Round(100.0 * $v.Count / [math]::Max(1,$kindRecords), 2)
+        $pct = if ($kindRecords -gt 0) { [math]::Round(100.0 * [double]$v.Count / [double]$kindRecords, 2) } else { 0.0 }
         $c = $v.Configuration
         Write-CsvRow $patternsWriter @(
             $role.Role,$role.Guid,$role.Priority,$v.ScopeKind,$kindRecords,$roleKindVariants[$v.RoleKindKey].Count,$c.Id,
