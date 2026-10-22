@@ -54,3 +54,18 @@ Get-Content $journal.FullName -TotalCount 5000 |
                 ForEach-Object { $_.enabledRules }) -join ', ')
         }} |
     Format-List
+
+# privileged roles check
+$roles = @(
+    'Owner'
+    'User Access Administrator'
+    'Role Based Access Control Administrator'
+    'Contributor'
+)
+
+Import-Csv $csv |
+    Where-Object { $_.Role -in $roles } |
+    Group-Object ScopeKind, Role, ActivationMFA, CAContextEnabled |
+    Sort-Object Name |
+    Select-Object Name, Count |
+    Format-Table -AutoSize
