@@ -16,6 +16,23 @@ $active |
     Sort-Object Role, ScopeName |
     Format-Table -AutoSize
 
+#check distribution
+$active = Import-Csv '.\PIMScopeAudit\pim_active_schedule_instances.csv'
+
+$active |
+    Select-Object AssignmentType, MemberType,
+        @{N='Expiry'; E={
+            if ([string]::IsNullOrWhiteSpace($_.EndDateTime)) {
+                'No end date'
+            } else {
+                'Time-bound'
+            }
+        }} |
+    Group-Object AssignmentType, MemberType, Expiry |
+    Sort-Object Count -Descending |
+    Select-Object Name, Count |
+    Format-Table -AutoSize
+    
 # limit to privileged roles.
 $privileged = @(
     'Owner'
