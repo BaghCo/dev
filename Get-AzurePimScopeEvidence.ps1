@@ -21,7 +21,7 @@
   .\Get-AzurePimScopeEvidence.ps1 -ManagementGroupId '<management-group-id>' `
       -PolicySettingsCsv '.\AzurePimReport\PimAnalysis_20261022_093616\policy_settings.csv'
 .EXAMPLE
-  .\Get-AzurePimScopeEvidence.ps1 -ReportOnly -OutputDirectory '.\PimScopeAudit' `
+  .\Get-AzurePimScopeEvidence-v3.ps1 -ReportOnly -OutputDirectory '.\PimScopeAudit' `
       -PolicySettingsCsv '.\AzurePimReport\PimAnalysis_20261022_093616\policy_settings.csv'
 .EXAMPLE
   .\Get-AzurePimScopeEvidence.ps1 -SubscriptionId (Get-AzContext).Subscription.Id `
@@ -699,8 +699,9 @@ Detail '|---|---|---|---|---|---:|---|---|---|---|---|'
 foreach ($e in @($script:Eligible | Sort-Object Tier, ScopeKind, Role, AssignmentScope, PrincipalId)) {
     $p = Find-Policy $e
     $desc = if($p){"MFA=$($p.MFA); CA=$($p.Context); approval=$($p.Approval)"}else{'Not joined'}
-    $pid = if($p){$p.PolicyId}else{''}
-    Detail "| $(ConvertTo-MarkdownCell $e.Status) | $(ConvertTo-MarkdownCell $e.Role) | $(ConvertTo-MarkdownCell $e.Tier) | $(ConvertTo-MarkdownCell "$($e.PrincipalId) ($($e.PrincipalType))") | $(ConvertTo-MarkdownCell $e.ScopePath) ; $(ConvertTo-MarkdownCell $e.AssignmentScope) | $($e.ObservedChildSubscriptions) | $(ConvertTo-MarkdownCell "start=$($e.StartDateTime), end=$($e.EndDateTime)") | $(ConvertTo-MarkdownCell $e.ScheduleId) | $(ConvertTo-MarkdownCell $e.RoleDefinitionId) | $(ConvertTo-MarkdownCell $desc) | $(ConvertTo-MarkdownCell $pid) |"
+    # Do not use a variable called PID: PowerShell reserves that name.
+    $matchedPolicyId = if($p){$p.PolicyId}else{''}
+    Detail "| $(ConvertTo-MarkdownCell $e.Status) | $(ConvertTo-MarkdownCell $e.Role) | $(ConvertTo-MarkdownCell $e.Tier) | $(ConvertTo-MarkdownCell "$($e.PrincipalId) ($($e.PrincipalType))") | $(ConvertTo-MarkdownCell $e.ScopePath) ; $(ConvertTo-MarkdownCell $e.AssignmentScope) | $($e.ObservedChildSubscriptions) | $(ConvertTo-MarkdownCell "start=$($e.StartDateTime), end=$($e.EndDateTime)") | $(ConvertTo-MarkdownCell $e.ScheduleId) | $(ConvertTo-MarkdownCell $e.RoleDefinitionId) | $(ConvertTo-MarkdownCell $desc) | $(ConvertTo-MarkdownCell $matchedPolicyId) |"
 }
 Detail ''
 Detail '## Active schedule instance evidence (not proof of eligibility)'
