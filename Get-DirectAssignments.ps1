@@ -15,3 +15,25 @@ $active |
         ScopeName, AssignmentScope, EndDateTime |
     Sort-Object Role, ScopeName |
     Format-Table -AutoSize
+
+# limit to privileged roles.
+$privileged = @(
+    'Owner'
+    'User Access Administrator'
+    'Role Based Access Control Administrator'
+    'Contributor'
+    'Key Vault Administrator'
+)
+
+$active |
+    Where-Object {
+        $_.AssignmentType -eq 'Assigned' -and
+        $_.MemberType -eq 'Direct' -and
+        [string]::IsNullOrWhiteSpace($_.EndDateTime) -and
+        $_.Role -in $privileged -and
+        $_.ScopeKind -in @('ManagementGroup','Subscription')
+    } |
+    Group-Object ScopeKind, Role |
+    Sort-Object Count -Descending |
+    Select-Object Name, Count |
+    Format-Table -AutoSize
