@@ -21,10 +21,16 @@
   .\Get-AzurePimScopeEvidence.ps1 -ManagementGroupId '<management-group-id>' `
       -PolicySettingsCsv '.\AzurePimReport\PimAnalysis_20261022_093616\policy_settings.csv'
 .EXAMPLE
+  .\Get-AzurePimScopeEvidence.ps1 -ReportOnly -OutputDirectory '.\PimScopeAudit' `
+      -PolicySettingsCsv '.\AzurePimReport\PimAnalysis_20261022_093616\policy_settings.csv'
+.EXAMPLE
   .\Get-AzurePimScopeEvidence.ps1 -SubscriptionId (Get-AzContext).Subscription.Id `
       -ScopeDepth ResourceGroups -IncludeCurrentRbac -OutputDirectory 'C:\Temp\PimScopeAudit'
 .NOTES
   Requires PowerShell 7 and Az.Accounts. This script makes only GET requests.
+  Use -ReportOnly -OutputDirectory <existing CSV folder> to regenerate Markdown
+  entirely offline without importing Az.Accounts or making any Azure requests.
+  -ReportOnly never overwrites the source CSV files.
   Uses ARM 2020-10-01 schedule APIs, ARM 2022-04-01 RBAC/role-definition APIs,
   ARM 2020-05-01 management-group API and ARM 2021-04-01 resource-group API.
   Restrict access to evidence exports containing principal IDs and scope paths.
@@ -37,26 +43,41 @@ param(
     [string] $ScopeDepth = 'ManagementGroupsAndSubscriptions',
     [string] $PolicySettingsCsv,
     [switch] $IncludeCurrentRbac,
+    [switch] $ReportOnly,
     [switch] $SkipRoleDefinitionLookup,
     [ValidateRange(1, 2000)][int] $MaxRoleLookups = 200,
     [ValidateRange(1, 100)][int] $Examples = 25,
     [string] $OutputDirectory = (Join-Path (Get-Location).Path 'PimScopeAudit')
 )
 $ErrorActionPreference = 'Stop'
-Import-Module Az.Accounts -ErrorAction Stop
-$ctx = Get-AzContext
-if (-not $ctx -or -not $ctx.Tenant -or -not $ctx.Tenant.Id) {
-    throw 'Connect to the correct tenant with Connect-AzAccount before running.'
+if (-not $ReportOnly) {
+    Import-Module Az.Accounts -ErrorAction Stop
+    $ctx = Get-AzContext
+    if (-not $ctx -or -not $ctx.Tenant -or -not $ctx.Tenant.Id) {
+        throw 'Connect to the correct tenant with Connect-AzAccount before running.'
+    }
+    if ($ManagementGroupId -and $SubscriptionId) { throw 'Supply either -ManagementGroupId or -SubscriptionId, not both.' }
+    if (-not $ManagementGroupId -and -not $SubscriptionId) { $ManagementGroupId = [string] $ctx.Tenant.Id }
+    if ($SubscriptionId -and $SubscriptionId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+        throw 'SubscriptionId must be a GUID, without the /subscriptions/ prefix.'
+    }
+} else {
+    if ($ManagementGroupId -or $SubscriptionId) {
+        throw 'In -ReportOnly mode the observed starting scopes come from observed_scope_hierarchy.csv; omit -ManagementGroupId and -SubscriptionId.'
+    }
+    # Tenant ID and precise scan start time were not included in the CSV exports.
+    $ctx = [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'Not recorded in saved CSVs' } }
 }
-if ($ManagementGroupId -and $SubscriptionId) { throw 'Supply either -ManagementGroupId or -SubscriptionId, not both.' }
-if (-not $ManagementGroupId -and -not $SubscriptionId) { $ManagementGroupId = [string] $ctx.Tenant.Id }
-if ($SubscriptionId -and $SubscriptionId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
-    throw 'SubscriptionId must be a GUID, without the /subscriptions/ prefix.'
+if (-not $ReportOnly) {
+    [void](New-Item -ItemType Directory -Path $OutputDirectory -Force)
+} elseif (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
+    throw "ReportOnly requires the EXISTING scan output directory, which was not found: $OutputDirectory"
 }
-[void] (New-Item -ItemType Directory -Path $OutputDirectory -Force)
 $dest = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $asOf = [datetime]::UtcNow
+$timingLabel = if ($ReportOnly) {'Source file last modified (UTC)'} else {'Evidence captured (UTC)'}
+$startLabel = if ($ReportOnly) {'From saved hierarchy'} elseif ($SubscriptionId) {"/subscriptions/$SubscriptionId"} else {$ManagementGroupId}
 
 $script:Nodes = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
 $script:Eligible = [System.Collections.Generic.List[object]]::new()
@@ -319,7 +340,7 @@ function Add-DirectRbacRows { param([string]$QueryScope,$Items)
     }
     return $added
 }
-function Md { param($Value)
+function ConvertTo-MarkdownCell { param($Value)
     $s = [string]$Value
     if (-not $s.Trim()) { return 'Not recorded' }
     $s = $s.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('|','\|').Replace("`r",' ').Replace("`n",' ').Replace('`','')
@@ -330,6 +351,7 @@ function Export-Evidence { param([object[]]$Rows,[string]$File)
     else { 'No records found; check scan_status.csv to distinguish zero findings from failed coverage.' | Set-Content -LiteralPath ($File + '.empty.txt') -Encoding utf8 }
 }
 
+if (-not $ReportOnly) {
 # Scope discovery. Do not silently infer access to all scopes from an incomplete hierarchy.
 if ($SubscriptionId) {
     Add-Node -Id "/subscriptions/$SubscriptionId" -Name $SubscriptionId
@@ -420,6 +442,64 @@ foreach ($node in $orderedScopes) {
     Write-Host ("{0}: eligible {1} ({2}); active schedules {3} ({4})" -f $node.ScopeName,$stat.DirectEligible,$stat.Eligible,$stat.DirectActive,$stat.ActiveSchedule)
 }
 
+} else {
+    # Rehydrate the exact data already collected. No Az commands or ARM requests.
+    # In particular, do not recalculate dates or mistake a missing file for zero grants.
+    function Read-SavedEvidence {
+        param([Parameter(Mandatory)][string]$Name, [switch]$AllowEmpty)
+        $file = Join-Path $dest $Name
+        if (Test-Path -LiteralPath $file -PathType Leaf) {
+            return @(Import-Csv -LiteralPath $file)
+        }
+        $sentinel = $file + '.empty.txt'
+        if ($AllowEmpty -and (Test-Path -LiteralPath $sentinel -PathType Leaf)) {
+            return @()
+        }
+        throw "Missing required completed scan export: $file. The partial CSVs are recovery files and are not automatically treated as completed evidence."
+    }
+
+    $savedNodes = @(Read-SavedEvidence 'observed_scope_hierarchy.csv')
+    $savedStatus = @(Read-SavedEvidence 'scan_status.csv')
+    $savedEligible = @(Read-SavedEvidence 'pim_eligible_assignments.csv' -AllowEmpty)
+    $savedActive = @(Read-SavedEvidence 'pim_active_schedule_instances.csv' -AllowEmpty)
+    if ($savedNodes.Count -eq 0 -or $savedStatus.Count -eq 0) {
+        throw 'The saved hierarchy or scan status CSV contains no rows. Report generation cannot assert scan coverage.'
+    }
+    foreach ($node in $savedNodes) {
+        Add-Node -Id ([string]$node.ScopeId) -Name ([string]$node.ScopeName) -ParentId ([string]$node.ParentId)
+    }
+    foreach ($entry in $savedStatus) { [void]$script:ScopesStatus.Add($entry) }
+    foreach ($entry in $savedEligible) { [void]$script:Eligible.Add($entry) }
+    foreach ($entry in $savedActive) { [void]$script:Active.Add($entry) }
+
+    if ($IncludeCurrentRbac) {
+        foreach ($entry in @(Read-SavedEvidence 'rbac_current_assignments.csv' -AllowEmpty)) {
+            [void]$script:Rbac.Add($entry)
+        }
+    }
+    $errorFile = Join-Path $dest 'errors.csv'
+    if (Test-Path -LiteralPath $errorFile -PathType Leaf) {
+        foreach ($entry in @(Import-Csv -LiteralPath $errorFile)) { [void]$script:Failures.Add($entry) }
+    }
+    # Cross-check the completed evidence against scan_status before presenting counts.
+    $expectedEligible = 0L
+    $expectedActive = 0L
+    foreach ($s in $savedStatus) {
+        $expectedEligible += [long]$s.DirectEligible
+        $expectedActive += [long]$s.DirectActive
+    }
+    if ($expectedEligible -ne $savedEligible.Count -or $expectedActive -ne $savedActive.Count) {
+        throw "Saved evidence count mismatch. scan_status.csv reports eligible=$expectedEligible and active=$expectedActive, but completed CSVs contain eligible=$($savedEligible.Count) and active=$($savedActive.Count). Inspect exports before relying on the report."
+    }
+    $statusFile = Get-Item -LiteralPath (Join-Path $dest 'scan_status.csv')
+    $asOf = $statusFile.LastWriteTimeUtc
+    $roots = @($script:Nodes.Values | Where-Object { -not $_.ParentId } | Sort-Object ScopeName | ForEach-Object ScopeName)
+    if ($roots.Count) { $startLabel = ($roots -join ', ') }
+    $orderedScopes = @($script:Nodes.Values | Sort-Object Kind,ScopeId)
+    Write-Host "Offline report mode: $($savedEligible.Count) eligibility records, $($savedActive.Count) active schedule records, $($orderedScopes.Count) scopes." -ForegroundColor Cyan
+    Write-Host 'No Azure connection or Graph permissions required; all scan CSVs remain unchanged.' -ForegroundColor Cyan
+}
+
 # Join an existing PIM policy CSV ONLY to actual collected grants at an exact scope + role.
 # This avoids labelling policy configurations for unused roles as actual eligibility.
 $policyIndex = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -447,6 +527,7 @@ function Find-Policy { param($A)
     return $null
 }
 
+if (-not $ReportOnly) {
 $eligiblePath = Join-Path $dest 'pim_eligible_assignments.csv'
 $activePath = Join-Path $dest 'pim_active_schedule_instances.csv'
 $rbacPath = Join-Path $dest 'rbac_current_assignments.csv'
@@ -458,6 +539,8 @@ if ($IncludeCurrentRbac) { Export-Evidence -Rows @($script:Rbac.ToArray()) -File
 $script:ScopesStatus.ToArray() | Export-Csv -LiteralPath $statusPath -NoTypeInformation -Encoding utf8
 @($script:Nodes.Values | Sort-Object Kind,ScopeId) | Export-Csv -LiteralPath $scopePath -NoTypeInformation -Encoding utf8
 if ($script:Failures.Count) { $script:Failures.ToArray() | Export-Csv -LiteralPath (Join-Path $dest 'errors.csv') -NoTypeInformation -Encoding utf8 }
+
+}
 
 # Create a main page usable by teams without RBAC/PIM knowledge and detailed evidence appendix.
 $md = [System.Collections.Generic.List[string]]::new()
@@ -475,7 +558,7 @@ $allNodeSub = @($script:Nodes.Values | Where-Object Kind -eq 'Subscription').Cou
 $allNodeRg = @($script:Nodes.Values | Where-Object Kind -eq 'ResourceGroup').Count
 Main '# Azure resource privileged access: assignment scope and reach'
 Main ''
-Main "**Evidence captured (UTC):** $($asOf.ToString('yyyy-MM-dd HH:mm')) | **Tenant:** $(Md $ctx.Tenant.Id) | **Starting scope:** $(Md $(if($SubscriptionId){"/subscriptions/$SubscriptionId"}else{$ManagementGroupId}))"
+Main "**$($timingLabel):** $($asOf.ToString('yyyy-MM-dd HH:mm')) | **Tenant:** $(ConvertTo-MarkdownCell $ctx.Tenant.Id) | **Observed starting scope:** $(ConvertTo-MarkdownCell $startLabel)"
 Main ''
 Main '**Status:** Preliminary access-governance review. Candidate scope exceptions are NOT confirmed violations of an approved standard. No Azure or Entra permissions were modified.'
 Main ''
@@ -504,6 +587,7 @@ Main "- Hierarchy discovery found **$allNodeSub subscriptions** and **$allNodeRg
 Main '- The descendant-subscription numbers below reflect **observed nodes**, not a certified complete inventory of the tenant.'
 Main '- A successful empty API result is not the same as an API failure. Any failed scopes are listed in `scan_status.csv` and `errors.csv`.'
 Main '- Group principal memberships, indirect PIM for Groups eligibility and Entra directory-role PIM are not expanded. Custom-role privileges need their own review.'
+if ($ReportOnly) { Main '- **Offline regeneration:** The displayed timestamp is the saved status CSV modification time, not a verified Azure collection timestamp. Only the Markdown files were regenerated.' }
 Main '- Current eligibility instances are point-in-time evidence; they are not an activation history. Schedule status and time validity are retained, and pending records are not counted as current. PIM role policies do not inherit in the same way as RBAC grants.'
 Main ''
 Main '## Current PIM eligibility by sensitivity and direct assignment scope'
@@ -530,7 +614,7 @@ foreach ($roleGroup in @($currentEligible | Group-Object Role | Sort-Object Coun
     $mgCount = @($records | Where-Object ScopeKind -eq 'ManagementGroup').Count
     $subCount = @($records | Where-Object ScopeKind -eq 'Subscription').Count
     $rgCount = @($records | Where-Object ScopeKind -eq 'ResourceGroup').Count
-    Main "| $(Md $roleGroup.Name) | $mgCount | $subCount | $rgCount | $($records.Count) |"
+    Main "| $(ConvertTo-MarkdownCell $roleGroup.Name) | $mgCount | $subCount | $rgCount | $($records.Count) |"
 }
 Main ''
 Main 'The table lists the 20 most frequent roles if more than 20 were collected; the evidence register retains every record. Resource-level assignments are outside this scan.'
@@ -569,8 +653,8 @@ else {
     foreach ($e in @($highBroad | Select-Object -First $Examples)) {
         $p = Find-Policy $e
         $policyText = 'Not joined'
-        if ($p) { $policyText = "MFA=$(Md $p.MFA); context=$(Md $p.Context); approval=$(Md $p.Approval)" }
-        Main "| $(Md $e.Role) ($($e.Tier)) | $(Md $e.PrincipalId) ($(Md $e.PrincipalType)) | $(Md $e.ScopePath) | $($e.ObservedChildSubscriptions) | $(Md $e.EndDateTime) | $policyText | $(Md $e.ScheduleId) |"
+        if ($p) { $policyText = "MFA=$(ConvertTo-MarkdownCell $p.MFA); context=$(ConvertTo-MarkdownCell $p.Context); approval=$(ConvertTo-MarkdownCell $p.Approval)" }
+        Main "| $(ConvertTo-MarkdownCell $e.Role) ($($e.Tier)) | $(ConvertTo-MarkdownCell $e.PrincipalId) ($(ConvertTo-MarkdownCell $e.PrincipalType)) | $(ConvertTo-MarkdownCell $e.ScopePath) | $($e.ObservedChildSubscriptions) | $(ConvertTo-MarkdownCell $e.EndDateTime) | $policyText | $(ConvertTo-MarkdownCell $e.ScheduleId) |"
     }
 }
 Main ''
@@ -590,7 +674,7 @@ Main '## Separate active-access observations'
 Main ''
 Main "PIM active schedule instances collected: **$($script:Active.Count)**. Those with `AssignmentType=Activated` can be distinguished in `pim_active_schedule_instances.csv` from `Assigned` entries."
 if ($IncludeCurrentRbac) { Main "Ordinary RBAC role assignments collected: **$($script:Rbac.Count)**. This is a separate evidence stream and may overlap active schedules; counts must not be added together." }
-else { Main 'Ordinary RBAC assignment enumeration was not requested. Rerun with `-IncludeCurrentRbac` only if that separate inventory is needed.' }
+else { Main 'Ordinary RBAC evidence was not included. If `rbac_current_assignments.csv` exists in the output directory, run this generator with `-ReportOnly -IncludeCurrentRbac`. Otherwise, a separate RBAC collection would be needed.' }
 Main ''
 Main '## Primary sources and audit trail'
 Main ''
@@ -606,7 +690,7 @@ Main '- Microsoft RBAC scope best practice: https://learn.microsoft.com/en-us/az
 
 Detail '# Azure PIM assignment scope: technical evidence register'
 Detail ''
-Detail "**As of UTC:** $($asOf.ToString('yyyy-MM-dd HH:mm')) | **Entries:** $($script:Eligible.Count) eligibility schedule instances."
+Detail "**$($timingLabel):** $($asOf.ToString('yyyy-MM-dd HH:mm')) | **Entries:** $($script:Eligible.Count) eligibility schedule instances."
 Detail ''
 Detail 'Rows identify independent grants, not duplicated role-policy settings. Grant scope is the source scope, while child subscriptions show observed reach.'
 Detail ''
@@ -616,7 +700,7 @@ foreach ($e in @($script:Eligible | Sort-Object Tier, ScopeKind, Role, Assignmen
     $p = Find-Policy $e
     $desc = if($p){"MFA=$($p.MFA); CA=$($p.Context); approval=$($p.Approval)"}else{'Not joined'}
     $pid = if($p){$p.PolicyId}else{''}
-    Detail "| $(Md $e.Status) | $(Md $e.Role) | $(Md $e.Tier) | $(Md "$($e.PrincipalId) ($($e.PrincipalType))") | $(Md $e.ScopePath) ; $(Md $e.AssignmentScope) | $($e.ObservedChildSubscriptions) | $(Md "start=$($e.StartDateTime), end=$($e.EndDateTime)") | $(Md $e.ScheduleId) | $(Md $e.RoleDefinitionId) | $(Md $desc) | $(Md $pid) |"
+    Detail "| $(ConvertTo-MarkdownCell $e.Status) | $(ConvertTo-MarkdownCell $e.Role) | $(ConvertTo-MarkdownCell $e.Tier) | $(ConvertTo-MarkdownCell "$($e.PrincipalId) ($($e.PrincipalType))") | $(ConvertTo-MarkdownCell $e.ScopePath) ; $(ConvertTo-MarkdownCell $e.AssignmentScope) | $($e.ObservedChildSubscriptions) | $(ConvertTo-MarkdownCell "start=$($e.StartDateTime), end=$($e.EndDateTime)") | $(ConvertTo-MarkdownCell $e.ScheduleId) | $(ConvertTo-MarkdownCell $e.RoleDefinitionId) | $(ConvertTo-MarkdownCell $desc) | $(ConvertTo-MarkdownCell $pid) |"
 }
 Detail ''
 Detail '## Active schedule instance evidence (not proof of eligibility)'
@@ -624,7 +708,7 @@ Detail ''
 Detail '| AssignmentType | Role | Principal ID | Exact assigned scope | Start | End | Schedule ID | Origin role-assignment ID |'
 Detail '|---|---|---|---|---|---|---|---|'
 foreach ($a in @($script:Active | Sort-Object Role, AssignmentScope, PrincipalId)) {
-    Detail "| $(Md $a.AssignmentType) | $(Md $a.Role) | $(Md $a.PrincipalId) | $(Md $a.AssignmentScope) | $(Md $a.StartDateTime) | $(Md $a.EndDateTime) | $(Md $a.ScheduleId) | $(Md $a.OriginRoleAssignmentId) |"
+    Detail "| $(ConvertTo-MarkdownCell $a.AssignmentType) | $(ConvertTo-MarkdownCell $a.Role) | $(ConvertTo-MarkdownCell $a.PrincipalId) | $(ConvertTo-MarkdownCell $a.AssignmentScope) | $(ConvertTo-MarkdownCell $a.StartDateTime) | $(ConvertTo-MarkdownCell $a.EndDateTime) | $(ConvertTo-MarkdownCell $a.ScheduleId) | $(ConvertTo-MarkdownCell $a.OriginRoleAssignmentId) |"
 }
 if ($IncludeCurrentRbac) {
     Detail ''
@@ -633,7 +717,7 @@ if ($IncludeCurrentRbac) {
     Detail '| Role | Principal ID / type | Exact scope | Observed child subscriptions | Role assignment ID | Conditional assignment expression |'
     Detail '|---|---|---|---:|---|---|'
     foreach ($a in @($script:Rbac | Sort-Object Role, AssignmentScope, PrincipalId)) {
-        Detail "| $(Md $a.Role) | $(Md "$($a.PrincipalId) ($($a.PrincipalType))") | $(Md $a.AssignmentScope) | $($a.ObservedChildSubscriptions) | $(Md $a.RoleAssignmentId) | $(Md $a.Condition) |"
+        Detail "| $(ConvertTo-MarkdownCell $a.Role) | $(ConvertTo-MarkdownCell "$($a.PrincipalId) ($($a.PrincipalType))") | $(ConvertTo-MarkdownCell $a.AssignmentScope) | $($a.ObservedChildSubscriptions) | $(ConvertTo-MarkdownCell $a.RoleAssignmentId) | $(ConvertTo-MarkdownCell $a.Condition) |"
     }
 }
 Detail ''
@@ -642,7 +726,7 @@ Detail ''
 Detail '| Scope | Eligible query | Active schedule query | Direct RBAC query |'
 Detail '|---|---|---|---|'
 foreach ($s in @($script:ScopesStatus | Where-Object { $_.Eligible -ne 'OK' -or $_.ActiveSchedule -ne 'OK' -or ($IncludeCurrentRbac -and $_.CurrentRbac -ne 'OK') })) {
-    Detail "| $(Md $s.ScopeId) | $(Md $s.Eligible) | $(Md $s.ActiveSchedule) | $(Md $s.CurrentRbac) |"
+    Detail "| $(ConvertTo-MarkdownCell $s.ScopeId) | $(ConvertTo-MarkdownCell $s.Eligible) | $(ConvertTo-MarkdownCell $s.ActiveSchedule) | $(ConvertTo-MarkdownCell $s.CurrentRbac) |"
 }
 Detail ''
 Detail '**Collection limitations:** No Graph permission is requested. Group membership and PIM for Groups are excluded. Descendants are limited to the observed hierarchy. Individual-resource assignments and resource groups omitted by the selected scan depth are not audited.'
@@ -653,4 +737,5 @@ $md.ToArray() | Set-Content -LiteralPath $mainPath -Encoding utf8
 $detail.ToArray() | Set-Content -LiteralPath $appendixPath -Encoding utf8
 Write-Host "`nConfluence report: $mainPath" -ForegroundColor Green
 Write-Host "Evidence appendix: $appendixPath" -ForegroundColor Green
+if ($ReportOnly) { Write-Host 'Report-only complete. The original CSV evidence was not modified.' -ForegroundColor Cyan }
 Write-Host "Eligibility $($script:Eligible.Count), active schedules $($script:Active.Count), RBAC $($script:Rbac.Count), scan errors $($script:Failures.Count)" -ForegroundColor Cyan
