@@ -75,3 +75,23 @@ $active |
     Sort-Object Count -Descending |
     Select-Object Name, Count |
     Format-Table -AutoSize
+
+# detail
+ $standing = $active | Where-Object {
+    $_.AssignmentType -eq 'Assigned' -and
+    $_.MemberType -eq 'Direct' -and
+    [string]::IsNullOrWhiteSpace($_.EndDateTime) -and
+    $_.Role -in $privileged -and
+    $_.ScopeKind -in @('ManagementGroup','Subscription')
+}
+
+$standing |
+    Sort-Object ScopeKind, ScopeName, Role |
+    Select-Object ScopeKind, ScopeName, Role,
+        PrincipalType, PrincipalId,
+        AssignmentScope, ScheduleId,
+        Status, Condition |
+    Export-Csv '.\PIMScopeAudit\Standing-Privileged-Access.csv' `
+        -NoTypeInformation
+
+Write-Host "Assignments exported: $($standing.Count)"
